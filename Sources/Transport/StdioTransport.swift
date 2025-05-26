@@ -57,6 +57,8 @@ public final actor StdioTransport: MCPTransport { // Changed from class to actor
 
     // private let lock = NSLock() // Removed NSLock, actor provides synchronization
     private var internalState: TransportConnectionState = .disconnected(error: nil)
+    private var hasFinishedStateStream: Bool = false
+    private var hasFinishedIncomingMessagesStream: Bool = false
 
     /// Initializes the StdioTransport with the command to launch the server process.
     ///
@@ -95,7 +97,7 @@ public final actor StdioTransport: MCPTransport { // Changed from class to actor
             throw StdioError.alreadyConnected
         }
 
-        await updateState(.connecting)
+        updateState(.connecting)
 
         self.process = Process()
         self.stdinPipe = Pipe()
@@ -107,7 +109,7 @@ public final actor StdioTransport: MCPTransport { // Changed from class to actor
               let stdoutPipe = self.stdoutPipe,
               let stderrPipe = self.stderrPipe else {
             let error = StdioError.pipeError("Failed to create process or pipes.")
-            await updateState(.disconnected(error: error))
+            updateState(.disconnected(error: error))
             throw error
         }
 
@@ -130,14 +132,14 @@ public final actor StdioTransport: MCPTransport { // Changed from class to actor
             print("StdioTransport: Process started successfully (\(process.processIdentifier)).")
         } catch {
             let wrappedError = StdioError.processLaunchFailed(error)
-            await updateState(.disconnected(error: wrappedError))
+            updateState(.disconnected(error: wrappedError))
             await cleanupResources() // Call actor method
             throw wrappedError
         }
 
-        await startReadingStdout()
-        await startReadingStderr() // For logging server errors
-        await updateState(.connected)
+        startReadingStdout()
+        startReadingStderr() // For logging server errors
+        updateState(.connected)
     }
 
     public func send(_ data: Data) async throws {
@@ -163,7 +165,7 @@ public final actor StdioTransport: MCPTransport { // Changed from class to actor
     public func disconnect() async {
         // Actor methods are implicitly synchronized
         print("StdioTransport: Disconnect called.")
-        await updateState(.disconnected(error: nil))
+        updateState(.disconnected(error: nil))
         await cleanupResources()
     }
 
@@ -181,7 +183,7 @@ public final actor StdioTransport: MCPTransport { // Changed from class to actor
             reason: terminatedProcess.terminationReason
         )
         if !internalState.isDisconnectedByClient {
-            await updateState(.disconnected(error: termError))
+            updateState(.disconnected(error: termError))
         }
         await cleanupResources()
     }
@@ -240,7 +242,7 @@ public final actor StdioTransport: MCPTransport { // Changed from class to actor
         if let p = self.process, p.isRunning, self.internalState.isConnected {
              let error = StdioError.stdoutPipeClosed
              if !self.internalState.isDisconnectedByClient {
-                 await self.updateState(.disconnected(error: error))
+                 updateState(.disconnected(error: error))
              }
         }
         await self.cleanupResources()
@@ -254,8 +256,8 @@ public final actor StdioTransport: MCPTransport { // Changed from class to actor
             print("StdioTransport: stderrReadTask started.")
             while let actorSelf = self { // Check self still exists
                  let isRunning = await actorSelf.process?.isRunning ?? false
-                 if !isRunning { print("StdioTransport: stderrReadTask - process not running."); break }
-                 if Task.isCancelled { print("StdioTransport: stderrReadTask cancelled."); break }
+                  if !isRunning { print("StdioTransport: stderrReadTask - process not running."); break }
+                  if Task.isCancelled { print("StdioTransport: stderrReadTask cancelled."); break }
                 
                 let dataChunk = stderrHandle.availableData
                 if dataChunk.isEmpty {
@@ -293,14 +295,16 @@ public final actor StdioTransport: MCPTransport { // Changed from class to actor
         self.stderrPipe = nil
 
         // Finish streams only if they haven't been finished yet.
-        // This check is crucial as finishing a continuation more than once can crash.
-        // We rely on the overall logic ensuring this is the final point for active streams.
-        if case .disconnected = internalState {
-            // Check a flag or if continuation is nil if it were optional to prevent multiple finishes.
-            // For simplicity here, assuming this is called at a point where finishing is safe.
-            // A more robust system might use a separate atomic flag.
+        if !hasFinishedIncomingMessagesStream {
             incomingMessagesContinuation.finish()
+            hasFinishedIncomingMessagesStream = true
+            print("StdioTransport: incomingMessagesContinuation finished.")
+        }
+        
+        if !hasFinishedStateStream {
             stateStreamContinuation.finish()
+            hasFinishedStateStream = true
+            print("StdioTransport: stateStreamContinuation finished.")
         }
     }
 }

@@ -7,13 +7,53 @@
 
 import Foundation
 // Assuming schema types are accessible from this module, e.g., part of the same target.
+// The MCPTransport protocol is now defined in Sources/Transport/MCPTransport.swift
+
+/// Represents the reason for disconnection.
+public enum DisconnectReason: Equatable {
+    case normal
+    case transportError(Error)
+    case connectionFailed(Error)
+    case disconnecting
+
+    public static func == (lhs: DisconnectReason, rhs: DisconnectReason) -> Bool {
+        switch (lhs, rhs) {
+        case (.normal, .normal):
+            return true
+        case (.transportError(let lhsError), .transportError(let rhsError)):
+            // Simplified comparison for demonstration. Consider more robust error comparison.
+            return (lhsError as NSError).domain == (rhsError as NSError).domain &&
+                   (lhsError as NSError).code == (rhsError as NSError).code
+        case (.connectionFailed(let lhsError), .connectionFailed(let rhsError)):
+            return (lhsError as NSError).domain == (rhsError as NSError).domain &&
+                   (lhsError as NSError).code == (rhsError as NSError).code
+        default:
+            return false
+        }
+    }
+}
 
 /// Represents the connection state of the MCPClient.
-public enum ConnectionState {
-    case disconnected
+public enum ConnectionState: Equatable {
+    case disconnected(reason: DisconnectReason?)
     case connecting
     case connected
     case disconnecting
+
+    public static func == (lhs: ConnectionState, rhs: ConnectionState) -> Bool {
+        switch (lhs, rhs) {
+        case (.disconnected(let reasonLHS), .disconnected(let reasonRHS)):
+            return reasonLHS == reasonRHS
+        case (.connecting, .connecting):
+            return true
+        case (.connected, .connected):
+            return true
+        case (.disconnecting, .disconnecting):
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 /// Custom errors specific to MCPClient operations.
@@ -33,29 +73,22 @@ public enum MCPClientError: Error {
     case notImplemented
 }
 
-// Placeholder for the transport protocol, to be defined in Phase 2
-public protocol MCPTransport {
-    func send(data: Data) async throws
-    // Conceptual: incomingMessages could be an AsyncStream or use a delegate/callback pattern
-    var incomingMessages: AsyncStream<Data> { get }
-    func connect() async throws
-    func disconnect()
-}
-
 /// MCPClient is an actor responsible for managing communication with an MCP server.
 /// It handles JSON-RPC 2.0 session management, request sending, and response/notification processing.
 public actor MCPClient {
     // MARK: - Properties
 
     /// The current connection state of the client.
-    public private(set) var connectionState: ConnectionState = .disconnected
+    public private(set) var connectionState: ConnectionState = .disconnected(reason: .normal)
 
     /// The transport mechanism used for sending and receiving data.
-    /// This will be set during connection.
-    private var transport: MCPTransport?
+    private let transport: MCPTransport
 
-    /// Configuration for the client, potentially including server details if not using stdio.
-    public let clientConfiguration: StdioServerConfiguration? // Assuming StdioServerConfiguration is defined
+    /// Configuration for the transport, dictating which transport is used and its parameters.
+    public let transportConfiguration: MCPTransportConfiguration
+
+    /// Capabilities of this client, to be sent during initialization.
+    private let clientCapabilities: ClientCapabilities
 
     /// Capabilities reported by the server after successful initialization.
     public private(set) var serverCapabilities: ServerCapabilities?
@@ -69,6 +102,9 @@ public actor MCPClient {
 
     /// Task responsible for processing incoming messages from the transport layer.
     private var messageProcessingTask: Task<Void, Error>?
+
+    /// Task responsible for observing the transport's connection state changes.
+    private var transportStateObservationTask: Task<Void, Never>?
 
     // MARK: - Internal Structures
 
@@ -87,70 +123,181 @@ public actor MCPClient {
 
     // MARK: - Initialization and Lifecycle
 
-    /// Initializes a new MCPClient.
-    /// - Parameter configuration: Optional configuration for the client.
-    public init(configuration: StdioServerConfiguration? = nil) {
-        self.clientConfiguration = configuration
-        // Transport is typically set via a connect method.
+    /// Initializes a new MCPClient with a specific transport configuration and client capabilities.
+    /// - Parameter transportConfiguration: The configuration specifying the transport to use.
+    /// - Parameter clientCapabilities: The capabilities of this client.
+    /// - Throws: An error if the transport cannot be initialized (though current transport inits don't throw).
+    public init(transportConfiguration: MCPTransportConfiguration, clientCapabilities: ClientCapabilities) throws {
+        self.transportConfiguration = transportConfiguration
+        self.clientCapabilities = clientCapabilities
+
+        switch transportConfiguration {
+        #if os(macOS)
+        case .stdio(let commandPath, let arguments):
+            self.transport = StdioTransport(commandPath: commandPath, arguments: arguments)
+        #endif
+        case .sse(let url, let maxRetryAttempts, let baseRetryDelay):
+            self.transport = SSETransport(url: url, maxRetryAttempts: maxRetryAttempts, baseRetryDelay: baseRetryDelay)
+        case .streamableHTTP(let url, let httpMethod):
+            self.transport = StreamableHTTPTransport(url: url, httpMethod: httpMethod)
+        // If stdio is the only case and it's not macOS, this might lead to a compile error
+        // Ensure all cases are handled or provide a default/error for non-macOS stdio if it were possible.
+        // Current MCPTransportConfiguration is #if os(macOS) for stdio, so this structure is fine.
+        }
     }
 
     deinit {
-        stopListeningToTransport()
+        // Ensure tasks are cancelled on deinitialization, though explicit disconnect is preferred.
+        messageProcessingTask?.cancel()
+        transportStateObservationTask?.cancel()
         // If transport has a synchronous disconnect, call it here.
         // Otherwise, an explicit async disconnect method is better.
     }
 
-    /// Establishes a connection to the server using the provided transport.
-    /// - Parameter transport: The transport mechanism to use.
-    public func connect(transport: MCPTransport) async throws {
-        guard connectionState == .disconnected || connectionState == .disconnecting else {
-            print("MCPClient: Already connected or in the process of connecting/disconnecting.")
-            throw MCPClientError.alreadyConnected // Or handle as appropriate
+    /// Establishes a connection to the server using the configured transport.
+    public func connect() async throws {
+        // Guard against multiple concurrent connection attempts or connecting when already connected.
+        // Allow re-connection if disconnected (even with an error).
+        guard connectionState == .disconnected(reason: nil) || 
+              connectionState == .disconnected(reason: .normal) || 
+              isDisconnectedWithErrorInternal() || 
+              connectionState == .disconnecting else {
+            print("MCPClient: Already connected or in the process of connecting/disconnecting from a non-error state: \(connectionState).")
+            throw MCPClientError.alreadyConnected
         }
 
-        self.transport = transport
         self.connectionState = .connecting
+        print("MCPClient: State changed to connecting.")
+
+        // Start observing transport state changes.
+        // This task should be managed (e.g., cancelled on disconnect).
+        transportStateObservationTask?.cancel() // Cancel any previous observation task
+        transportStateObservationTask = Task {
+            // Now using the stateStream from the MCPTransport protocol.
+            print("MCPClient: Starting transport state observation task.")
+            for await transportState in self.transport.stateStream { 
+               print("MCPClient: Received transport state: \(transportState)")
+               switch transportState {
+               case .connecting:
+                   // MCPClient itself initiates connecting state, transport confirms.
+                   // Only update if not already connecting or connected from client's perspective.
+                   if self.connectionState != .connecting && self.connectionState != .connected {
+                       self.connectionState = .connecting
+                       print("MCPClient: State changed to connecting (from transport stateStream).")
+                   }
+               case .connected:
+                   if self.connectionState != .connected {
+                       self.connectionState = .connected
+                       print("MCPClient: State changed to connected (from transport stateStream).")
+                   }
+               case .disconnected(let error):
+                   print("MCPClient: Transport reported disconnected via stateStream, error: \(String(describing: error)). Initiating client disconnect.")
+                   if let err = error {
+                       // Avoid re-disconnecting if already in the process for the same transport error
+                       if case .disconnected(reason: .transportError(let existingError)) = self.connectionState, (err as NSError).isEqual(existingError as NSError) {
+                           // Already disconnected for this specific transport error
+                       } else if case .disconnected(reason: .connectionFailed(let existingError)) = self.connectionState, (err as NSError).isEqual(existingError as NSError) {
+                           // Already disconnected for this specific connection failure error
+                       } else {
+                           await self.disconnect(reason: .transportError(err))
+                       }
+                   } else {
+                       // Avoid re-disconnecting if already disconnected normally
+                       if self.connectionState != .disconnected(reason: .normal) {
+                           await self.disconnect(reason: .normal)
+                       }
+                   }
+                   return // Exit task as client is disconnecting or already disconnected by transport's report.
+               }
+            }
+            print("MCPClient: Transport state observation task finished (stream closed).")
+            // If the stream closes, ensure client is in a disconnected state if not already handled by a .disconnected event.
+            if self.connectionState != .disconnected(reason: .normal) && !self.isDisconnectedWithErrorInternal() {
+               await self.disconnect(reason: .normal) 
+            }
+        }
+
+        // Start listening to incoming messages from the transport.
+        // This is the messageProcessingTask.
+        startListeningToTransportInternal() // Renamed to avoid confusion with a potentially public API
 
         do {
             try await transport.connect()
+            // If connect succeeds, we assume the transport is connected.
+            // The stateStream (when implemented) would confirm this.
+            // For now, directly set to connected if no error.
             self.connectionState = .connected
-            startListeningToTransport()
-            print("MCPClient: Connected and listening for messages.")
+            print("MCPClient: transport.connect() succeeded. State changed to connected.")
+            
+            // If a handshake is required by MCPClient *after* the transport layer connects, trigger it here.
+            // e.g., try await self.performHandshake()
+
         } catch {
-            self.connectionState = .disconnected
-            self.transport = nil
-            print("MCPClient: Connection failed - \(error)")
+            print("MCPClient: transport.connect() failed. Error: \(error)")
+            let disconnectReason = DisconnectReason.connectionFailed(error)
+            await self.disconnect(reason: disconnectReason)
             throw error
         }
     }
 
     /// Disconnects from the server and cleans up resources.
-    public func disconnect() async {
-        guard connectionState == .connected || connectionState == .connecting else {
-            print("MCPClient: Not connected.")
-            return
+    public func disconnect(reason: DisconnectReason = .normal) async {
+        guard connectionState == .connected || connectionState == .connecting || connectionState == .disconnecting else {
+            // If already disconnected with the same reason, or trying to disconnect normally from an error state, allow.
+            if case .disconnected(let currentReason) = connectionState, currentReason == reason { return } // Already disconnected with this reason
+            // Allow disconnecting normally even if previously disconnected with error
+            if reason == .normal, case .disconnected = connectionState { /* allow */ } 
+            else if connectionState != .connecting { // if not connecting, and not one of the above, then it's an invalid state to disconnect from
+                 print("MCPClient: Not in a valid state to disconnect (current: \(connectionState), requested reason: \(reason)).")
+                 return
+            }
         }
 
-        self.connectionState = .disconnecting
-        stopListeningToTransport()
-        transport?.disconnect() // Assuming transport has a disconnect method
-        self.transport = nil
+        // If already disconnecting, and this call is for a different reason (e.g. error during disconnecting)
+        // we might want to update the reason. For now, let's assume disconnect is idempotent if already disconnecting.
+        if connectionState == .disconnecting && reason != .normal {
+             print("MCPClient: Already disconnecting. New disconnect reason \(reason) requested.")
+             // Potentially update a pending disconnect reason if that's a desired feature.
+        } else {
+            self.connectionState = .disconnecting
+        }
+        
+        stopListeningToTransportInternal() // Renamed to ensure it calls the task canceller
+        await transport.disconnect() // MCPTransport.disconnect is async
+        // If MCPTransport.disconnect becomes async, this should be `await transport.disconnect()`
+        
         self.pendingRequests.forEach { _, value in
-            value.continuation.resume(throwing: MCPClientError.transportError(CocoaError(.userCancelled)))
+            value.continuation.resume(throwing: MCPClientError.transportError(CocoaError(.userCancelled))) // Or a more specific error based on disconnect reason
         }
         self.pendingRequests.removeAll()
-        self.connectionState = .disconnected
-        print("MCPClient: Disconnected.")
+        self.connectionState = .disconnected(reason: reason)
+        print("MCPClient: Disconnected. Reason: \(reason)")
+    }
+
+    // Helper to check if currently disconnected due to an error
+    private func isDisconnectedWithError() -> Bool {
+        if case .disconnected(let reason) = connectionState, reason != .normal && reason != nil {
+            return true
+        }
+        return false
+    }
+
+    // Helper to check if currently disconnected due to an error (internal version)
+    private func isDisconnectedWithErrorInternal() -> Bool {
+        if case .disconnected(let reason) = connectionState, reason != .normal && reason != nil {
+            return true
+        }
+        return false
     }
 
     // MARK: - API Layer (Public Methods)
 
     /// Initializes the JSON-RPC session with the server.
-    /// The client sends its capabilities, and the server responds with its own.
-    /// - Parameter clientCapabilities: The capabilities of this client.
+    /// The client sends its capabilities (provided at MCPClient initialization),
+    /// and the server responds with its own.
     /// - Returns: The capabilities of the server.
-    public func initialize(clientCapabilities: ClientCapabilities) async throws -> ServerCapabilities {
-        let params = InitializeRequestParams(capabilities: clientCapabilities)
+    public func initialize() async throws -> ServerCapabilities {
+        let params = InitializeRequestParams(capabilities: self.clientCapabilities)
         // The `sendRequest` method handles JSON-RPC wrapping, ID generation, sending, and response matching.
         // It's expected to return the decoded result of the type specified (ServerCapabilities in this case).
         let serverCaps: ServerCapabilities = try await self.sendRequest(method: "session/initialize", params: params)
@@ -222,7 +369,7 @@ public actor MCPClient {
     ///   - params: The parameters for the method, conforming to `Encodable`.
     /// - Returns: The decoded result of the method call, conforming to `Decodable`.
     private func sendRequest<Params: Encodable, ResultType: Decodable>(method: String, params: Params) async throws -> ResultType {
-        guard connectionState == .connected, let currentTransport = transport else {
+        guard connectionState == .connected else {
             print("MCPClient: Not connected, cannot send request.")
             throw MCPClientError.notConnected
         }
@@ -245,7 +392,7 @@ public actor MCPClient {
 
             Task {
                 do {
-                    try await currentTransport.send(data: encodedRequestData)
+                    try await transport.send(data: encodedRequestData)
                 } catch {
                     print("MCPClient: Failed to send request \(requestID) over transport - \(error)")
                     if let removed = self.pendingRequests.removeValue(forKey: requestID) {
@@ -257,20 +404,15 @@ public actor MCPClient {
     }
 
     /// Starts a task to listen for and process incoming messages from the transport.
-    private func startListeningToTransport() {
-        guard let currentTransport = self.transport else {
-            print("MCPClient Error: Transport not available to start listening.")
-            // Optionally, set state to disconnected or throw
-            return
-        }
-
+    private func startListeningToTransportInternal() { // Renamed from startListeningToTransport
+        // Transport is non-optional, so no need to guard for its existence here.
         // Ensure any existing task is cancelled before starting a new one.
         messageProcessingTask?.cancel()
 
         messageProcessingTask = Task {
             print("MCPClient: Message processing task started. Awaiting messages from transport...")
             do {
-                for try await data in currentTransport.incomingMessages {
+                for try await data in transport.incomingMessages {
                     if Task.isCancelled { break }
                     // print("MCPClient RECV: \(String(data: data, encoding: .utf8) ?? "")")
                     await self.handleIncomingData(data) // Actor re-entrancy ensures sequential processing
@@ -281,7 +423,7 @@ public actor MCPClient {
                 } else {
                     print("MCPClient: Message processing task ended with error - \(error)")
                     // Handle transport errors, e.g., by attempting to reconnect or transitioning to a disconnected state.
-                    await self.disconnect() // Example: trigger disconnect
+                    await self.disconnect(reason: .transportError(error)) // Pass the specific error
                 }
             }
             print("MCPClient: Message processing task finished.")
@@ -289,77 +431,70 @@ public actor MCPClient {
     }
 
     /// Stops the task that listens for incoming messages.
-    private func stopListeningToTransport() {
+    private func stopListeningToTransportInternal() { // Renamed from stopListeningToTransport
+        print("MCPClient: Stopping message processing task.")
         messageProcessingTask?.cancel()
         messageProcessingTask = nil
-        print("MCPClient: Message processing task stopped.")
+
+        print("MCPClient: Stopping transport state observation task.")
+        transportStateObservationTask?.cancel()
+        transportStateObservationTask = nil
     }
 
-    /// Handles incoming raw data from the transport, parsing and dispatching it.
-    /// This method is called sequentially by the `messageProcessingTask`.
+    /// Handles raw incoming data from the transport, decoding it as a JSON-RPC message.
     private func handleIncomingData(_ data: Data) async {
         // Attempt to decode the base message to determine its type
         let baseMessage: BaseMessage
         do {
             baseMessage = try JSONDecoder().decode(BaseMessage.self, from: data)
         } catch {
-            print("MCPClient: Failed to decode base message structure - \(error). Data: \(String(data: data, encoding: .utf8) ?? "Invalid UTF-8")")
-            // This could be a malformed message; decide how to handle (e.g., log and ignore)
+            print("MCPClient Error: Failed to decode base message: \(error). Data: \(String(data: data, encoding: .utf8) ?? "Invalid UTF8")")
+            // Consider how to handle undecipherable messages. For now, just log and ignore.
             return
         }
 
-        // Case 1: Response to a previous request (has ID, no method)
-        if let id = baseMessage.id, baseMessage.method == nil {
+        if let id = baseMessage.id, baseMessage.method == nil { // Response (id present, method absent)
             await handleResponse(id: id, data: data)
-        }
-        // Case 2: Notification from server (has method, no ID)
-        else if let method = baseMessage.method, baseMessage.id == nil {
+        } else if let method = baseMessage.method, baseMessage.id == nil { // Notification (method present, id absent)
             await handleNotification(method: method, data: data)
-        }
-        // Case 3: Request from server (has ID and method)
-        else if let id = baseMessage.id, let method = baseMessage.method {
+        } else if let method = baseMessage.method, let id = baseMessage.id { // Server Request (method and id present)
             await handleServerRequest(id: id, method: method, data: data)
-        }
-        // Case 4: Unknown message structure
-        else {
-            print("MCPClient: Received message with unknown structure. ID: \(baseMessage.id ?? "nil"), Method: \(baseMessage.method ?? "nil")")
-            // This indicates a non-compliant message or a parsing issue not caught by BaseMessage decoding.
+        } else {
+            print("MCPClient Error: Unexpected message format. Data: \(String(data: data, encoding: .utf8) ?? "Invalid UTF8")")
         }
     }
 
     /// Handles a JSON-RPC response message.
     private func handleResponse(id: String, data: Data) async {
         guard let pending = pendingRequests.removeValue(forKey: id) else {
-            print("MCPClient: Received unsolicited response for ID \(id). Ignoring.")
+            print("MCPClient: Received unsolicited response for ID \(id). Ignoring. Data: \(String(data: data, encoding: .utf8) ?? "")")
             // It's important not to throw here if the continuation is not found,
             // as this method is part of the general message handling loop.
-            // Instead, log and potentially track unsolicited responses if needed.
             return
         }
 
         do {
-            // Decode the full response, using AnyCodable for result and JSONRPCErrorObject for error
-            let response = try JSONDecoder().decode(JSONRPCResponse<AnyCodable, JSONRPCErrorObject>.self, from: data)
+            // First, try to decode as a successful response for the expected type
+            // This requires a generic helper or careful handling of `pending.responseType`
+            // For simplicity, let's assume JSONRPCResponse can be decoded with AnyCodable for result first,
+            // then attempt to convert to the specific type.
+            let genericResponse = try JSONDecoder().decode(JSONRPCResponse<AnyCodable, JSONRPCErrorObject>.self, from: data)
 
-            if let errorObject = response.error {
-                print("MCPClient: Received error for request \(id): \(errorObject)")
+            if let errorObject = genericResponse.error {
+                print("MCPClient: Received error response for ID \(id): \(errorObject)")
                 pending.continuation.resume(throwing: MCPClientError.jsonRpcError(errorObject))
-            } else if let anyCodableResult = response.result {
-                // Attempt to cast/decode AnyCodable to the specific expected ResultType
-                do {
-                    let typedResult = try anyCodableResult.decode(to: pending.responseType)
-                    pending.continuation.resume(returning: typedResult)
-                } catch {
-                    print("MCPClient: Failed to decode result for request \(id) to type \(pending.responseType) - \(error)")
-                    pending.continuation.resume(throwing: MCPClientError.responseDecodingFailed(error))
-                }
+            } else if let resultValue = genericResponse.result {
+                // Now, try to convert AnyCodable to the actual expected Decodable type
+                let specificResultData = try resultValue.encode()
+                let specificResult = try JSONDecoder().decode(pending.responseType, from: specificResultData)
+                pending.continuation.resume(returning: specificResult)
             } else {
-                // This case should ideally not happen if the response is well-formed (either result or error must be present)
-                print("MCPClient: Response for request \(id) had neither result nor error.")
+                // This case should ideally not happen if JSON-RPC is followed (either result or error must be present)
+                print("MCPClient Error: Response for ID \(id) has neither result nor error.")
                 pending.continuation.resume(throwing: MCPClientError.unexpectedMessageFormat)
             }
         } catch {
-            print("MCPClient: Failed to decode JSONRPCResponse for ID \(id) - \(error)")
+            print("MCPClient Error: Failed to decode or process response for ID \(id): \(error). Data: \(String(data: data, encoding: .utf8) ?? "")")
             pending.continuation.resume(throwing: MCPClientError.responseDecodingFailed(error))
         }
     }
@@ -367,44 +502,26 @@ public actor MCPClient {
     /// Handles a JSON-RPC notification message.
     private func handleNotification(method: String, data: Data) async {
         print("MCPClient: Received notification: \(method). Data: \(String(data: data, encoding: .utf8) ?? "")")
-        // TODO: Implement full notification handling
-        // 1. Define a generic JSONRPCNotification<Params: Decodable> struct.
-        // 2. Decode `data` into this struct.
-        // 3. Route based on `method` to specific handlers or delegates.
-        // Example:
-        // switch method {
-        // case "textDocument/publishDiagnostics":
-        //     if let params = try? JSONDecoder().decode(PublishDiagnosticsParams.self, from: data) {
-        //         delegate?.didReceiveDiagnostics(params)
-        //     }
-        // default:
-        //     print("Unhandled notification: \(method)")
-        // }
+        // TODO: Implement notification handling logic
+        // This might involve delegates, callbacks, or specific notification handler methods.
+        // Example: NotificationCenter.default.post(name: .init(method), object: decodedNotificationParams)
     }
 
     /// Handles a JSON-RPC request message initiated by the server.
     private func handleServerRequest(id: String, method: String, data: Data) async {
-        print("MCPClient: Received server request: \(method) (id: \(id)). Data: \(String(data: data, encoding: .utf8) ?? "")")
-        // TODO: Implement full server-initiated request handling
-        // 1. Define a generic JSONRPCRequest<Params: Decodable> struct for incoming requests.
-        // 2. Decode `data` into this struct.
-        // 3. Route based on `method` to specific handlers.
-        // 4. The handler must eventually send a JSONRPCResponse (result or error) back to the server using `transport.send()`.
-        // Example:
-        // switch method {
-        // case "workspace/applyEdit":
-        //     // ... process and respond
-        // default:
-        //     // Send back a methodNotFound error
-        //     let error = JSONRPCErrorObject(code: -32601, message: "Method not found", data: nil)
-        //     let response = JSONRPCResponse<Never, JSONRPCErrorObject>(id: id, result: nil, error: error) // Assuming Never for ResultType
-        //     // try? await transport?.send(data: JSONEncoder().encode(response))
-        // }
-        let error = JSONRPCErrorObject(code: -32601, message: "Server-initiated requests not yet supported by client", data: nil)
+        print("MCPClient: Received server request: \(method) (ID: \(id)). Data: \(String(data: data, encoding: .utf8) ?? "")")
+        // TODO: Implement server request handling logic
+        // This would involve decoding the params, processing the request, and sending a response.
+        // For now, send a 'method_not_found' error.
+        let error = JSONRPCErrorObject(code: -32601, message: "Method not found", data: nil)
+        await sendErrorResponse(forRequestID: id, error: error)
+    }
+
+    private func sendErrorResponse(forRequestID id: String, error: JSONRPCErrorObject) async {
         let response = JSONRPCResponse<EmptyCodable, JSONRPCErrorObject>(id: id, result: nil, error: error) // Using EmptyCodable for no result
         do {
             let responseData = try JSONEncoder().encode(response)
-            try await transport?.send(data: responseData)
+            try await transport.send(data: responseData)
         } catch {
             print("MCPClient: Failed to send error response for server request \(id): \(error)")
         }
@@ -413,116 +530,54 @@ public actor MCPClient {
 
 // MARK: - Helper Schema Types (Assumed to be defined elsewhere, or here if simple)
 
-public struct StdioServerConfiguration: Codable { /* ... */ }
+// These are example param/result structs. Actual definitions should come from your schema files.
+// Ensure they are Codable.
+
 public struct ClientCapabilities: Codable { /* ... */ }
-public struct ServerCapabilities: Codable { /* e.g., version: String, otherCaps: ... */ }
-public struct Resource: Codable { /* e.g., id: String, name: String, type: String */ }
-public struct Prompt: Codable { /* e.g., id: String, text: String, metadata: [String: AnyCodable]? */ }
-public struct CallToolResult: Codable { /* e.g., output: AnyCodable, error: String? */ }
-
-// For listResources
-public struct ListResourcesResult: Codable { public let resources: [Resource] }
-
-// For getPrompt
-public struct GetPromptParams: Codable { public let id: String }
-public struct GetPromptResult: Codable { public let prompt: Prompt }
-
-// For initialize
-public struct InitializeRequestParams: Codable { public let capabilities: ClientCapabilities }
-// ServerCapabilities is directly returned for initialize
-
-// For callTool
-public struct CallToolParams: Codable { 
-    public let name: String
-    public let arguments: [String: AnyCodable]?
-}
-// CallToolResult is directly returned for callTool
-
-// For readResource (New)
-public struct ReadResourceParams: Codable {
-    public let id: String
-    public let version: String?
-}
-public struct ResourceContent: Codable { /* e.g., content: String, format: String */ }
-
-// For methods that take no parameters
-private struct EmptyParams: Encodable {}
-
-public struct AnyCodable: Codable { // Basic implementation for example
-    private let value: Any
-
-    public init<T>(_ value: T?) {
-        self.value = value ?? ()
-    }
-
-    public func decode<T: Decodable>(to type: T.Type) throws -> T {
-        let data = try JSONEncoder().encode(self) // Re-encode to then decode specifically
-        return try JSONDecoder().decode(T.self, from: data)
-    }
-    // Implement Encodable and Decodable conformance
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
-        if let encodable = value as? Encodable {
-            try encodable.encode(to: encoder) // This won't work directly as `Encodable` has `Self` requirements
-                                            // A proper AnyCodable implementation is more complex, often using type erasure or specific encoding strategies.
-                                            // For simplicity here, we assume it can be re-encoded if it was originally Decodable.
-            // This is a placeholder for a real AnyCodable implementation.
-            // A common approach is to encode to a dictionary or array if possible, or to Data.
-            // For now, let's assume a simple path if it's a common JSON type.
-            switch value {
-            case let val as String: try container.encode(val)
-            case let val as Int: try container.encode(val)
-            case let val as Double: try container.encode(val)
-            case let val as Bool: try container.encode(val)
-            case let val as [Any?]: try container.encode(val.map { AnyCodable($0) })
-            case let val as [String: Any?]: try container.encode(val.mapValues { AnyCodable($0) })
-            default:
-                // Attempt to convert to Data then to a generic structure if possible, or throw
-                // This part is highly dependent on the actual AnyCodable implementation used.
-                // For this example, we'll throw if not a simple type.
-                throw EncodingError.invalidValue(value, EncodingError.Context(codingPath: [], debugDescription: "AnyCodable can only encode basic JSON types or requires a more robust implementation."))
-            }
-        } else {
-            try container.encodeNil()
-        }
-    }
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if container.decodeNil() { self.value = () } 
-        else if let bool = try? container.decode(Bool.self) { self.value = bool }
-        else if let int = try? container.decode(Int.self) { self.value = int }
-        else if let double = try? container.decode(Double.self) { self.value = double }
-        else if let string = try? container.decode(String.self) { self.value = string }
-        else if let array = try? container.decode([AnyCodable].self) { self.value = array.map { $0.value } }
-        else if let dictionary = try? container.decode([String: AnyCodable].self) { self.value = dictionary.mapValues { $0.value } }
-        else { throw DecodingError.dataCorruptedError(in: container, debugDescription: "AnyCodable value cannot be decoded") }
-    }
+public struct ServerCapabilities: Codable { /* ... */ }
+public struct InitializeRequestParams: Codable {
+    public let capabilities: ClientCapabilities
 }
 
-public struct EmptyCodable: Codable {}
-
-// Specific Request/Result types (examples)
-public struct InitializeRequestParams: Codable { let capabilities: ClientCapabilities }
-// ServerCapabilities is the result type for Initialize
-
+public struct Resource: Codable { /* ... */ }
 public struct ListResourcesResult: Codable { let resources: [Resource] }
 
+public struct Prompt: Codable { /* ... */ }
 public struct GetPromptParams: Codable { let id: String }
 public struct GetPromptResult: Codable { let prompt: Prompt }
 
-public struct CallToolParams: Codable { 
+public struct ResourceContent: Codable { /* ... */ }
+public struct ReadResourceParams: Codable { let id: String, version: String? }
+
+public struct CallToolResult: Codable { /* ... */ }
+public struct CallToolParams: Codable {
     let name: String
-    let arguments: [String: AnyCodable]?
+    let arguments: [String: AnyCodable]? // Using AnyCodable for flexible arguments
 }
-public struct CallToolRequest: Codable { let params: CallToolParams }
-// CallToolResult is the result type for CallTool
 
-// For readResource (New)
-public struct ReadResourceParams: Codable {
-    let id: String
-    let version: String?
+// For requests with no parameters
+public struct EmptyParams: Codable {}
+public struct EmptyCodable: Codable {} // For responses with no meaningful result or error data
+
+// Represents the basic structure of a JSON-RPC error object.
+public struct JSONRPCErrorObject: Codable, Error {
+    public let code: Int
+    public let message: String
+    public let data: AnyCodable? // Flexible data field
 }
-public struct ResourceContent: Codable { /* e.g., content: String, format: String */ }
 
-// Assume these are defined in your Schema module
-// JSONRPCRequest, JSONRPCResponse, JSONRPCErrorObject are internal concerns handled by sendRequest/handleIncomingData
+// Represents a JSON-RPC request.
+public struct JSONRPCRequest<Params: Encodable>: Encodable {
+    public let jsonrpc = "2.0"
+    public let id: String
+    public let method: String
+    public let params: Params?
+}
+
+// Represents a JSON-RPC response.
+public struct JSONRPCResponse<ResultType: Decodable, ErrorType: Decodable>: Decodable {
+    public let jsonrpc: String
+    public let id: String? // Optional for notifications, but required for responses we care about matching.
+    public let result: ResultType?
+    public let error: ErrorType?
+}
