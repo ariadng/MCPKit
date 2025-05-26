@@ -37,6 +37,65 @@ The `MCPClient` is an actor responsible for managing communication with an MCP (
 -   `handleServerRequest<Params: Decodable, ResultType: Encodable>(method: String, handler: @escaping (Params?) async throws -> ResultType) async`:
     Registers a handler for incoming server-initiated requests for a specific method.
 
+## Handling Server-Initiated Messages
+
+`MCPClient` allows the application to respond to messages initiated by the server (notifications and requests) by providing callback closures. These are public properties on the `MCPClient` instance.
+
+### Server Notifications
+
+The client can listen for specific notifications sent by the server:
+
+*   **`onLoggingMessage: ((LoggingMessageNotification.Params) -> Void)?`**
+    *   Called when the server sends a `logging/message` notification.
+    *   The `LoggingMessageNotification.Params` type (defined in the `Schema` module) provides details like `level`, `logger`, and the log `data` (as `AnyCodable`).
+    *   Example:
+        ```swift
+        client.onLoggingMessage = { params in
+            print("Server Log [\(params.level)] (\(params.logger ?? "default")): \(params.data)")
+            // Further processing of logParams.data if it's a structured object
+        }
+        ```
+
+*   **`onResourceUpdate: ((ResourceUpdatedNotification.Params) -> Void)?`**
+    *   Called when the server sends a `resources/updated` notification, typically after the client has subscribed to resource updates.
+    *   The `ResourceUpdatedNotification.Params` type (defined in the `Schema` module) provides the `uri` of the updated resource.
+    *   Example:
+        ```swift
+        client.onResourceUpdate = { params in
+            print("Resource updated on server: \(params.uri)")
+            // Logic to refresh or re-fetch the resource
+        }
+        ```
+
+### Server-Initiated Requests
+
+The client can handle requests initiated by the server:
+
+*   **`onSamplingCreateMessage: ((CreateMessageRequest.Params) async throws -> CreateMessageResult)?`**
+    *   Called when the server sends a `sampling/createMessage` request, asking the client to generate a message (e.g., using a local LLM).
+    *   The handler receives `CreateMessageRequest.Params` (from the `Schema` module), which includes details like `messages` (context), `modelPreferences`, `maxTokens`, etc.
+    *   The handler must be `async`, can `throw` an error (which will be sent back to the server as a JSON-RPC error), and must return a `CreateMessageResult` (also from the `Schema` module). The `CreateMessageResult` includes fields like `role`, `content` (as `SamplingMessage.MessageContent`), and `model`.
+    *   If no handler is set, the `MCPClient` will automatically respond to the server with a "method not found" error.
+    *   Example:
+        ```swift
+        client.onSamplingCreateMessage = { requestParams async throws -> CreateMessageResult in
+            // Logic to process requestParams (e.g., select model, generate content)
+            let generatedContent = // ... your message generation logic ...
+            
+            // Assuming SamplingMessage.MessageContent.text for simplicity
+            let responseContent = SamplingMessage.MessageContent.text(generatedContent)
+            
+            return CreateMessageResult(
+                role: .assistant, 
+                content: responseContent,
+                model: "my-client-llm-v1.0",
+                stopReason: "completed"
+            )
+        }
+        ```
+
+To use these, assign your custom handler closure to the corresponding property on your `MCPClient` instance before or after connecting.
+
 ## Internal Structures
 
 -   `PendingRequest`: A private struct holding a `CheckedContinuation` and the expected `Decodable.Type` for a pending request. This is used to manage asynchronous responses.

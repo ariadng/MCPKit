@@ -31,10 +31,10 @@ Capabilities related to roots.
 ### sampling
 
 ```swift
-public var sampling: AnyCodable?
+public var sampling: SamplingCapabilities?
 ```
 
-Capabilities related to sampling.
+Capabilities related to message sampling, such as handling server-initiated requests to create messages.
 
 ## Nested Types
 
@@ -64,10 +64,36 @@ public init(listChanged: Bool? = nil)
 
 Creates a new `RootsCapabilities` instance with the specified listChanged value.
 
+### SamplingCapabilities
+
+```swift
+public struct SamplingCapabilities: Codable
+```
+
+A structure that represents capabilities related to message sampling.
+
+#### Properties
+
+##### supportsCreateMessageRequest
+
+```swift
+public var supportsCreateMessageRequest: Bool?
+```
+
+Whether the client supports handling server-initiated `sampling/createMessage` requests. If `true`, the server may send `sampling/createMessage` requests, and the client is expected to have a handler set for `MCPClient.onSamplingCreateMessage`.
+
+#### Initialization
+
+```swift
+public init(supportsCreateMessageRequest: Bool? = nil)
+```
+
+Creates a new `SamplingCapabilities` instance.
+
 ## Initialization
 
 ```swift
-public init(experimental: [String: AnyCodable]? = nil, roots: RootsCapabilities? = nil, sampling: AnyCodable? = nil)
+public init(experimental: [String: AnyCodable]? = nil, roots: RootsCapabilities? = nil, sampling: SamplingCapabilities? = nil)
 ```
 
 Creates a new `ClientCapabilities` instance with the specified experimental capabilities, roots capabilities, and sampling capabilities.

@@ -36,11 +36,29 @@ public actor MCPClient {
     /// Counter for generating unique request IDs.
     private var requestIDCounter: Int = 0
 
+    /// JSON encoder for serializing requests.
+    private let jsonEncoder = JSONEncoder()
+
+    /// JSON decoder for deserializing responses and notifications.
+    private let jsonDecoder = JSONDecoder()
+
     /// Task responsible for processing incoming messages from the transport layer.
     private var messageProcessingTask: Task<Void, Error>?
 
     /// Task responsible for observing the transport's connection state changes.
     private var transportStateObservationTask: Task<Void, Never>?
+
+    // MARK: - Public Callbacks for Server-Initiated Messages
+
+    /// Called when the server sends a 'logging/message' notification.
+    public var onLoggingMessage: ((LoggingMessageNotification.Params) -> Void)?
+
+    /// Called when the server sends a 'resources/updated' notification.
+    public var onResourceUpdate: ((ResourceUpdatedNotification.Params) -> Void)?
+
+    /// Called when the server sends a 'sampling/createMessage' request. 
+    /// The handler should return a `CreateMessageResult` or throw an error.
+    public var onSamplingCreateMessage: ((CreateMessageRequest.Params) async throws -> CreateMessageResult)?
 
     // MARK: - Internal Structures
 
@@ -52,9 +70,11 @@ public actor MCPClient {
 
     /// A helper struct to decode the base fields of a JSON-RPC message
     /// to determine if it's a response, notification, or server request.
-    private struct BaseMessage: Decodable {
-        let id: String?
+    private struct JSONRPCMessageBase: Decodable {
+        let id: RequestId?
         let method: String?
+        let result: AnyCodable?
+        let error: JSONRPCErrorObject?
     }
 
     // MARK: - Initialization and Lifecycle
@@ -289,55 +309,68 @@ public actor MCPClient {
         return result
     }
 
-    // MARK: - Message Dispatch/Session Layer
+    // MARK: - Request Handling
 
     /// Generates the next unique request ID.
-    /// IDs are simple integers converted to strings.
     private func nextRequestID() -> String {
         requestIDCounter += 1
         return String(requestIDCounter)
     }
 
-    /// Sends a JSON-RPC request to the server and awaits its response.
-    /// This is a private method used by the public API methods to abstract JSON-RPC details.
+    /// Sends a request to the server and awaits its response.
     /// - Parameters:
-    ///   - method: The name of the JSON-RPC method to call (e.g., "session/initialize").
-    ///   - params: The parameters for the method, conforming to `Encodable`.
-    /// - Returns: The decoded result of the method call, conforming to `Decodable`.
-    private func sendRequest<Params: Encodable, ResultType: Decodable>(method: String, params: Params) async throws -> ResultType {
-        guard connectionState == .connected else {
-            print("MCPClient: Not connected, cannot send request.")
-            throw MCPClientError.notConnected
-        }
+    ///   - method: The JSON-RPC method name.
+    ///   - params: The parameters for the request, conforming to Encodable.
+    /// - Returns: The decoded result of the request.
+    /// - Throws: An error if sending or decoding fails, or if the server returns an error.
+    private func sendRequest<Params: Encodable, ResultType: Decodable>(
+        method: String,
+        params: Params?
+    ) async throws -> ResultType {
+        let requestIDString = nextRequestID()
+        // Assuming RequestId is a struct/enum from schema that can be initialized with a string value.
+        // e.g., if RequestId is struct RequestId { let value: String }, then RequestId(value: requestIDString)
+        let mcpRequestID = RequestId(value: requestIDString) // Adjust if RequestId init is different
 
-        let requestID = nextRequestID()
-        let rpcRequest = JSONRPCRequest(id: requestID, method: method, params: params)
+        // Construct the JSON-RPC request object using schema types.
+        // JSONRPCRequest.params expects AnyCodable?, so wrap params if present.
+        let jsonRpcRequest = JSONRPCRequest(id: mcpRequestID, method: method, params: params.map { AnyCodable($0) })
 
         let encodedRequestData: Data
         do {
-            encodedRequestData = try JSONEncoder().encode(rpcRequest)
-            // print("MCPClient SEND [\(requestID)]: \(String(data: encodedRequestData, encoding: .utf8) ?? "")")
+            encodedRequestData = try self.jsonEncoder.encode(jsonRpcRequest)
+            // For debugging:
+            // print("MCPClient [Request ID: \(requestIDString)] Sending: \(String(data: encodedRequestData, encoding: .utf8) ?? "Non-UTF8 data")")
         } catch {
-            print("MCPClient: Failed to encode request \(requestID) - \(error)")
-            throw MCPClientError.requestEncodingFailed(error)
+            // Encoding failed, no continuation stored yet, just throw.
+            throw MCPClientError.encodingError(description: "Failed to encode request for method \(method)", underlyingError: error)
         }
 
         return try await withCheckedThrowingContinuation { continuation in
-            let pending = PendingRequest(continuation: continuation as! CheckedContinuation<Any, Error>, responseType: ResultType.self)
-            self.pendingRequests[requestID] = pending
+            let pendingRequest = PendingRequest(continuation: continuation as! CheckedContinuation<Any, Error>, responseType: ResultType.self)
+            self.pendingRequests[requestIDString] = pendingRequest
 
             Task {
                 do {
-                    try await transport.send(data: encodedRequestData)
+                    // Ensure client is connected before sending. Transport is non-optional.
+                    guard self.connectionState == .connected else {
+                        if self.pendingRequests.removeValue(forKey: requestIDString) != nil {
+                            (continuation as! CheckedContinuation<ResultType, Error>).resume(throwing: MCPClientError.clientNotConnected)
+                        }
+                        return
+                    }
+                    try await self.transport.send(encodedRequestData)
                 } catch {
-                    print("MCPClient: Failed to send request \(requestID) over transport - \(error)")
-                    if let removed = self.pendingRequests.removeValue(forKey: requestID) {
-                        removed.continuation.resume(throwing: MCPClientError.transportError(error))
+                    // Transport failed to send. Remove pending request and resume continuation with error.
+                    if self.pendingRequests.removeValue(forKey: requestIDString) != nil {
+                        (continuation as! CheckedContinuation<ResultType, Error>).resume(throwing: error)
                     }
                 }
             }
         }
     }
+
+    // MARK: - Message Dispatch/Session Layer
 
     /// Starts a task to listen for and process incoming messages from the transport.
     private func startListeningToTransportInternal() { // Renamed from startListeningToTransport
@@ -380,86 +413,193 @@ public actor MCPClient {
     /// Handles raw incoming data from the transport, decoding it as a JSON-RPC message.
     private func handleIncomingData(_ data: Data) async {
         // Attempt to decode the base message to determine its type
-        let baseMessage: BaseMessage
+        let baseMessage: JSONRPCMessageBase
         do {
-            baseMessage = try JSONDecoder().decode(BaseMessage.self, from: data)
+            baseMessage = try self.jsonDecoder.decode(JSONRPCMessageBase.self, from: data)
         } catch {
             print("MCPClient Error: Failed to decode base message: \(error). Data: \(String(data: data, encoding: .utf8) ?? "Invalid UTF8")")
             // Consider how to handle undecipherable messages. For now, just log and ignore.
             return
         }
 
-        if let id = baseMessage.id, baseMessage.method == nil { // Response (id present, method absent)
-            await handleResponse(id: id, data: data)
-        } else if let method = baseMessage.method, baseMessage.id == nil { // Notification (method present, id absent)
-            await handleNotification(method: method, data: data)
-        } else if let method = baseMessage.method, let id = baseMessage.id { // Server Request (method and id present)
-            await handleServerRequest(id: id, method: method, data: data)
+        // 1. Check for Response (id is present, and result or error is present)
+        if let id = baseMessage.id, (baseMessage.result != nil || baseMessage.error != nil) {
+            // This is a Response to a client-initiated request
+            guard let pending = self.pendingRequests.removeValue(forKey: id.stringValue) else { // Assuming RequestId has stringValue or similar
+                print("MCPClient Error: Received response for unknown request ID: \(id.stringValue). Discarding. Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
+                // Log MCPClientError.unknownRequestID(id.stringValue) if you have a logging mechanism
+                return
+            }
+
+            if let errorObject = baseMessage.error {
+                // Server returned an error
+                print("MCPClient: Received error response for ID \(id.stringValue): \(errorObject.code) - \(errorObject.message)")
+                let mcpError = MCPClientError.serverError(code: errorObject.code, message: errorObject.message, data: errorObject.data)
+                (pending.continuation as! CheckedContinuation<AnyDecodable, MCPClientError>).resume(throwing: mcpError) // Cast to specific error type if not Any
+            } else if let resultObject = baseMessage.result {
+                // Server returned a successful result
+                do {
+                    // The resultObject is AnyCodable. We need to decode it into the specific PendingRequest.responseType.
+                    let resultData = try self.jsonEncoder.encode(resultObject) // Re-encode AnyCodable to Data
+                    let typedResult = try self.jsonDecoder.decode(pending.responseType, from: resultData) // Decode to expected type
+                    // print("MCPClient: Successfully decoded result for ID \(id.stringValue) to type \(pending.responseType)")
+                    pending.continuation.resume(returning: typedResult)
+                } catch {
+                    print("MCPClient Error: Failed to decode result for request ID \(id.stringValue) into type \(pending.responseType). Error: \(error). Result data: \(String(describing: baseMessage.result))")
+                    let mcpError = MCPClientError.decodingError(description: "Failed to decode result for request ID: \(id.stringValue) into \(pending.responseType)", underlyingError: error)
+                    (pending.continuation as! CheckedContinuation<AnyDecodable, MCPClientError>).resume(throwing: mcpError)
+                }
+            } else {
+                // Should not happen if id is present and it's a response (violates JSON-RPC spec if neither result nor error)
+                print("MCPClient Error: Received response for ID \(id.stringValue) with no result or error. Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
+                let mcpError = MCPClientError.invalidMessageFormat(description: "Response for ID \(id.stringValue) had neither result nor error.")
+                (pending.continuation as! CheckedContinuation<AnyDecodable, MCPClientError>).resume(throwing: mcpError)
+            }
+
+        // 2. Check for Notification (method is present, id is ABSENT)
+        } else if let methodName = baseMessage.method, baseMessage.id == nil {
+            // This is a Server-to-Client Notification
+            // print("MCPClient: Received notification for method \(methodName)")
+            do {
+                // Decode the full notification including params
+                let notification = try self.jsonDecoder.decode(JSONRPCNotification<AnyCodable>.self, from: data)
+                await self.dispatchNotification(notification)
+            } catch {
+                print("MCPClient Error: Failed to decode notification for method \(methodName). Error: \(error). Data: \(String(data: data, encoding: .utf8) ?? "Invalid UTF8")")
+                // Log MCPClientError.decodingError or .invalidMessageFormat
+            }
+
+        // 3. Check for Server-Initiated Request (method is present, id is present, AND no result/error)
+        } else if let methodName = baseMessage.method, let requestID = baseMessage.id, baseMessage.result == nil && baseMessage.error == nil {
+            // This is a Server-Initiated Request to the Client
+            // print("MCPClient: Received server-initiated request (ID: \(requestID.stringValue), Method: \(methodName))")
+            do {
+                let serverRequest = try self.jsonDecoder.decode(JSONRPCRequest<AnyCodable>.self, from: data)
+                await self.dispatchServerRequest(serverRequest)
+            } catch {
+                print("MCPClient Error: Failed to decode server-initiated request (ID: \(requestID.stringValue), Method: \(methodName)). Error: \(error). Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
+                // Optionally, try to send a parse error response if requestID was parsable
+                // let errorResponse = JSONRPCResponse(id: requestID, error: JSONRPCErrorObject.parseError(message: "Failed to parse server request: \(error.localizedDescription)"))
+                // try? await self.sendRawResponse(errorResponse)
+            }
         } else {
-            print("MCPClient Error: Unexpected message format. Data: \(String(data: data, encoding: .utf8) ?? "Invalid UTF8")")
+            // Invalid or unknown message structure
+            print("MCPClient Error: Received message with unknown structure. Not a valid Response, Notification, or Server Request. Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
+            // Log MCPClientError.invalidMessageFormat
         }
     }
 
-    /// Handles a JSON-RPC response message.
-    private func handleResponse(id: String, data: Data) async {
-        guard let pending = pendingRequests.removeValue(forKey: id) else {
-            print("MCPClient: Received unsolicited response for ID \(id). Ignoring. Data: \(String(data: data, encoding: .utf8) ?? "")")
-            // It's important not to throw here if the continuation is not found,
-            // as this method is part of the general message handling loop.
+    // MARK: - Notification and Server Request Dispatchers
+
+    private func dispatchNotification(_ notification: JSONRPCNotification<AnyCodable>) async {
+        // print("MCPClient: Dispatching notification: \(notification.method)")
+        switch notification.method {
+        case "logging/message":
+            do {
+                let params = try decodeParams(notification.params, as: LoggingMessageNotification.Params.self)
+                await self.handleLoggingMessageNotification(params: params)
+            } catch {
+                print("MCPClient Error: Failed to decode params for 'logging/message' notification. Error: \(error)")
+            }
+        case "resources/updated":
+            do {
+                let params = try decodeParams(notification.params, as: ResourceUpdatedNotification.Params.self)
+                await self.handleResourceUpdateNotification(params: params)
+            } catch {
+                print("MCPClient Error: Failed to decode params for 'resources/updated' notification. Error: \(error)")
+            }
+        // Add more cases for other notifications
+        default:
+            print("MCPClient Warning: Received unhandled notification method: \(notification.method)")
+        }
+    }
+
+    private func dispatchServerRequest(_ request: JSONRPCRequest<AnyCodable>) async {
+        // print("MCPClient: Dispatching server request: \(request.method), ID: \(request.id.stringValue)")
+        switch request.method {
+        case "sampling/createMessage": // Example for MCP Sampling
+            do {
+                let params = try decodeParams(request.params, as: CreateMessageRequest.Params.self)
+                await self.handleSamplingCreateMessageRequest(id: request.id, params: params)
+            } catch {
+                print("MCPClient Error: Failed to decode params for 'sampling/createMessage' request. ID: \(request.id.stringValue). Error: \(error)")
+                let errorResponse = JSONRPCResponse(id: request.id, error: JSONRPCErrorObject.invalidParams(message: "Failed to decode params: \(error.localizedDescription)"))
+                await self.sendRawResponse(errorResponse)
+            }
+        // Add more cases for other server-initiated requests
+        default:
+            print("MCPClient Warning: Received server-initiated request for unknown method: \(request.method). ID: \(request.id.stringValue)")
+            let errorResponse = JSONRPCResponse(id: request.id, error: JSONRPCErrorObject.methodNotFound(methodName: request.method))
+            await self.sendRawResponse(errorResponse)
+        }
+    }
+
+    /// Helper to send a pre-constructed JSONRPCResponse (typically an error response for server requests).
+    private func sendRawResponse<T: Encodable, E: Encodable>(_ response: JSONRPCResponse<T, E>) async {
+        do {
+            let encodedResponse = try self.jsonEncoder.encode(response)
+            try await self.transport.send(encodedResponse)
+        } catch {
+            print("MCPClient Error: Failed to encode or send raw response for ID \(response.id.stringValue). Error: \(error)")
+        }
+    }
+
+    /// Helper function to decode AnyCodable parameters into a specific Decodable type.
+    private func decodeParams<T: Decodable>(_ anyCodableParams: AnyCodable?, as type: T.Type) throws -> T {
+        guard let params = anyCodableParams else {
+            // This case depends on whether nil params are valid for T. 
+            // If T itself is Optional, this might be fine. If T is non-optional, this is an error.
+            // For simplicity, let's assume if params are expected, anyCodableParams shouldn't be nil.
+            // Or, T could be an optional type itself e.g. MyParamsType?
+            throw MCPClientError.decodingError(description: "Expected parameters of type \(String(describing: T.self)) but received nil AnyCodable.", underlyingError: nil)
+        }
+        let paramsData = try self.jsonEncoder.encode(params) // Re-encode AnyCodable to Data
+        return try self.jsonDecoder.decode(T.self, from: paramsData) // Decode to expected type
+    }
+
+    // MARK: - Placeholder Notification Handlers
+
+    private func handleLoggingMessageNotification(params: LoggingMessageNotification.Params) async {
+        // print("MCPClient [Server Log]: \(params.data)") // Access actual log data via params.data
+        if let handler = self.onLoggingMessage {
+            handler(params)
+        } else {
+            print("MCPClient: 'logging/message' notification received, but no onLoggingMessage handler is set.")
+        }
+    }
+
+    private func handleResourceUpdateNotification(params: ResourceUpdatedNotification.Params) async {
+        // print("MCPClient [Resource Update]: Resource \(params.uri) updated.")
+        if let handler = self.onResourceUpdate {
+            handler(params)
+        } else {
+            print("MCPClient: 'resources/updated' notification received, but no onResourceUpdate handler is set.")
+        }
+    }
+
+    // MARK: - Placeholder Server-Initiated Request Handlers
+
+    private func handleSamplingCreateMessageRequest(id: RequestId, params: CreateMessageRequest.Params) async {
+        // print("MCPClient [Server Request]: Received 'sampling/createMessage' with ID \(id.stringValue) and params: \(params)")
+        
+        guard let appHandler = self.onSamplingCreateMessage else {
+            print("MCPClient: 'sampling/createMessage' request received, but no onSamplingCreateMessage handler is set.")
+            let error = JSONRPCErrorObject.methodNotFound(methodName: "sampling/createMessage (handler not configured on client)")
+            let response = JSONRPCResponse<AnyCodable, JSONRPCErrorObject>(id: id, error: error)
+            await self.sendRawResponse(response)
             return
         }
 
         do {
-            // First, try to decode as a successful response for the expected type
-            // This requires a generic helper or careful handling of `pending.responseType`
-            // For simplicity, let's assume JSONRPCResponse can be decoded with AnyCodable for result first,
-            // then attempt to convert to the specific type.
-            let genericResponse = try JSONDecoder().decode(JSONRPCResponse<AnyCodable, JSONRPCErrorObject>.self, from: data)
-
-            if let errorObject = genericResponse.error {
-                print("MCPClient: Received error response for ID \(id): \(errorObject)")
-                pending.continuation.resume(throwing: MCPClientError.jsonRpcError(errorObject))
-            } else if let resultValue = genericResponse.result {
-                // Now, try to convert AnyCodable to the actual expected Decodable type
-                let specificResultData = try resultValue.encode()
-                let specificResult = try JSONDecoder().decode(pending.responseType, from: specificResultData)
-                pending.continuation.resume(returning: specificResult)
-            } else {
-                // This case should ideally not happen if JSON-RPC is followed (either result or error must be present)
-                print("MCPClient Error: Response for ID \(id) has neither result nor error.")
-                pending.continuation.resume(throwing: MCPClientError.unexpectedMessageFormat)
-            }
+            let result = try await appHandler(params)
+            let response = JSONRPCResponse(id: id, result: result)
+            await self.sendRawResponse(response)
         } catch {
-            print("MCPClient Error: Failed to decode or process response for ID \(id): \(error). Data: \(String(data: data, encoding: .utf8) ?? "")")
-            pending.continuation.resume(throwing: MCPClientError.responseDecodingFailed(error))
-        }
-    }
-
-    /// Handles a JSON-RPC notification message.
-    private func handleNotification(method: String, data: Data) async {
-        print("MCPClient: Received notification: \(method). Data: \(String(data: data, encoding: .utf8) ?? "")")
-        // TODO: Implement notification handling logic
-        // This might involve delegates, callbacks, or specific notification handler methods.
-        // Example: NotificationCenter.default.post(name: .init(method), object: decodedNotificationParams)
-    }
-
-    /// Handles a JSON-RPC request message initiated by the server.
-    private func handleServerRequest(id: String, method: String, data: Data) async {
-        print("MCPClient: Received server request: \(method) (ID: \(id)). Data: \(String(data: data, encoding: .utf8) ?? "")")
-        // TODO: Implement server request handling logic
-        // This would involve decoding the params, processing the request, and sending a response.
-        // For now, send a 'method_not_found' error.
-        let error = JSONRPCErrorObject(code: -32601, message: "Method not found", data: nil)
-        await sendErrorResponse(forRequestID: id, error: error)
-    }
-
-    private func sendErrorResponse(forRequestID id: String, error: JSONRPCErrorObject) async {
-        let response = JSONRPCResponse<EmptyCodable, JSONRPCErrorObject>(id: id, result: nil, error: error) // Using EmptyCodable for no result
-        do {
-            let responseData = try JSONEncoder().encode(response)
-            try await transport.send(data: responseData)
-        } catch {
-            print("MCPClient: Failed to send error response for server request \(id): \(error)")
+            print("MCPClient: Application handler for 'sampling/createMessage' (ID: \(id.stringValue)) threw an error: \(error.localizedDescription)")
+            // You might want to define a more specific error code for application errors.
+            let jsonRpcError = JSONRPCErrorObject.internalError(message: "Application handler for 'sampling/createMessage' failed: \(error.localizedDescription)")
+            let response = JSONRPCResponse<AnyCodable, JSONRPCErrorObject>(id: id, error: jsonRpcError)
+            await self.sendRawResponse(response)
         }
     }
 }
