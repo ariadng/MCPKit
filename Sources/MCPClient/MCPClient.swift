@@ -7,7 +7,8 @@
 
 import Foundation
 import Combine
-import Schema
+import MCPSchema
+import MCPTransport
 
 /// MCPClient is an actor responsible for managing communication with an MCP server.
 /// It handles JSON-RPC 2.0 session management, request sending, and response/notification processing.
@@ -15,7 +16,7 @@ public actor MCPClient {
     // MARK: - Nested ConnectionState Enum
 
     /// Represents the connection state of the MCPClient.
-    public enum ConnectionState: Equatable {
+    public enum ConnectionState: Equatable, @unchecked Sendable {
         case disconnected(error: Error? = nil)
         case connecting
         case connected
@@ -76,6 +77,12 @@ public actor MCPClient {
     /// Capabilities of this client, to be sent during initialization.
     private let clientCapabilities: ClientCapabilities
 
+    /// Information about this client implementation.
+    private let clientInfo: Implementation
+
+    /// The MCP protocol version this client supports.
+    private let protocolVersion: String
+
     /// Capabilities reported by the server after successful initialization.
     public private(set) var serverCapabilities: ServerCapabilities? = nil
 
@@ -132,7 +139,7 @@ public actor MCPClient {
         let id: RequestId?
         let method: String?
         let result: AnyCodable?
-        let error: Schema.JSONRPCError.ErrorObject? // Ensure this exact type
+        let error: MCPSchema.JSONRPCError.ErrorObject? // Ensure this exact type
     }
 
     // MARK: - Structures for Ping
@@ -144,6 +151,8 @@ public actor MCPClient {
     /// Initializes a new MCPClient with a specific transport configuration and client capabilities.
     /// - Parameter transportConfiguration: The configuration specifying the transport to use.
     /// - Parameter clientCapabilities: The capabilities of this client.
+    /// - Parameter clientInfo: Information about this client implementation.
+    /// - Parameter protocolVersion: The MCP protocol version this client supports.
     /// - Parameter heartbeatInterval: Optional interval in seconds for sending heartbeat pings. Defaults to nil (disabled).
     /// - Parameter enableAutoReconnect: Whether to enable automatic reconnection. Defaults to true.
     /// - Parameter maxReconnectAttempts: Maximum number of reconnection attempts. Defaults to 5.
@@ -153,6 +162,8 @@ public actor MCPClient {
     /// - Throws: An error if the transport cannot be initialized (though current transport inits don't throw).
     public init(transportConfiguration: MCPTransportConfiguration, 
                 clientCapabilities: ClientCapabilities, 
+                clientInfo: Implementation, 
+                protocolVersion: String, 
                 heartbeatInterval: TimeInterval? = nil,
                 enableAutoReconnect: Bool = true,
                 maxReconnectAttempts: Int = 5,
@@ -161,7 +172,9 @@ public actor MCPClient {
                 reconnectDelayJitterFactor: Double = 0.25
     ) throws {
         self.transportConfiguration = transportConfiguration
-        self.clientCapabilities = clientCapabilities // Ensure clientCapabilities is initialized
+        self.clientCapabilities = clientCapabilities
+        self.clientInfo = clientInfo
+        self.protocolVersion = protocolVersion
         self.heartbeatInterval = heartbeatInterval
         self.enableAutoReconnect = enableAutoReconnect
         self.maxReconnectAttempts = maxReconnectAttempts
@@ -175,9 +188,9 @@ public actor MCPClient {
             self.transport = StdioTransport(commandPath: commandPath, arguments: arguments)
         #endif
         case .sse(let url, let maxRetryAttempts, let baseRetryDelay):
-            self.transport = SSETransport(url: url, maxRetryAttempts: maxRetryAttempts, baseRetryDelay: baseRetryDelay)
+            self.transport = SSETransport(serverURL: url, maxRetryAttempts: maxRetryAttempts, baseRetryDelay: baseRetryDelay)
         case .streamableHTTP(let url, let httpMethod):
-            self.transport = StreamableHTTPTransport(url: url, httpMethod: httpMethod)
+            self.transport = StreamableHTTPTransport(serverURL: url, httpMethod: httpMethod)
         // If stdio is the only case and it's not macOS, this might lead to a compile error
         // Ensure all cases are handled or provide a default/error for non-macOS stdio if it were possible.
         // Current MCPTransportConfiguration is #if os(macOS) for stdio, so this structure is fine.
@@ -237,8 +250,9 @@ public actor MCPClient {
             // If the stream closes and we are not already disconnected, transition to disconnected.
             if self.connectionState != .disconnected(error: nil) && !isDisconnectedWithError() {
                 print("MCPClient: Transport stream closed, ensuring client is disconnected.")
-                self.connectionState = .disconnected(error: MCPClientError.transportError(NSError(domain: "MCPClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "Transport stream closed unexpectedly"])))
-                await self.cleanupConnectionTasksAndState(isGraceful: false, error: self.connectionState)
+                let disconnectError = MCPClientError.transportError(NSError(domain: "MCPClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "Transport stream closed unexpectedly"]))
+                self.connectionState = .disconnected(error: disconnectError)
+                await self.cleanupConnectionTasksAndState(isGraceful: false, error: disconnectError)
             }
         }
 
@@ -281,7 +295,7 @@ public actor MCPClient {
                     do {
                         // 4. Perform MCP Handshake
                         print("MCPClient: Performing initialize handshake...")
-                        let initializeResult = try await self.initialize(clientCapabilities: self.clientCapabilities)
+                        let initializeResult = try await self.initialize()
                         self.serverCapabilities = initializeResult.capabilities
                         self.handshakeInProgress = false
                         // 5. Transition to Connected (MCP Level)
@@ -440,8 +454,12 @@ public actor MCPClient {
     /// The client sends its capabilities (provided at MCPClient initialization),
     /// and the server responds with its own.
     /// - Returns: The capabilities of the server.
-    public func initialize(clientCapabilities: ClientCapabilities) async throws -> InitializeResult {
-        let params = InitializeRequestParams(capabilities: clientCapabilities)
+    public func initialize() async throws -> InitializeResult {
+        let params = InitializeRequest.Params(
+            protocolVersion: self.protocolVersion,
+            capabilities: self.clientCapabilities,
+            clientInfo: self.clientInfo
+        )
         // The `sendRequest` method handles JSON-RPC wrapping, ID generation, sending, and response matching.
         // It's expected to return the decoded result of the type specified (ServerCapabilities in this case).
         let serverCaps: InitializeResult = try await self.sendRequest(method: "session/initialize", params: params)
@@ -462,40 +480,25 @@ public actor MCPClient {
     ///   - params: The parameters for the request, conforming to Encodable.
     /// - Returns: The decoded result of the request.
     /// - Throws: An error if sending or decoding fails, or if the server returns an error.
-    private func sendRequest<Params: Encodable, ResultType: Decodable>(
+    private func sendRequest<ParamsType: Encodable, ResultType: Decodable>(
         method: String,
-        params: Params?
+        params: ParamsType,
+        customID: String? = nil
     ) async throws -> ResultType {
-        let requestIDString = nextRequestID()
-        // Assuming RequestId is a struct/enum from schema that can be initialized with a string value.
-        // e.g., if RequestId is struct RequestId { let value: String }, then RequestId(value: requestIDString)
-        let mcpRequestID = RequestId(value: requestIDString) // Adjust if RequestId init is different
+        let requestIDString = customID ?? nextRequestID()
+        let mcpRequestID = RequestId.string(requestIDString)
 
-        // Encode params to AnyCodable for Schema.JSONRPCRequest
-        let anyCodableParams: AnyCodable?
-        if Params.self == NoParams.self {
-            anyCodableParams = nil
-        } else {
-            do {
-                anyCodableParams = try AnyCodable(params)
-            } catch {
-                print("MCPClient Error: Failed to encode params to AnyCodable for method \(method): \(error)")
-                throw MCPClientError.requestEncodingFailed(error)
-            }
-        }
+        let rpcRequest = JSONRPCRequest(id: mcpRequestID, method: method, params: AnyCodable(params)) // Corrected argument order
 
-        let request = Schema.JSONRPCRequest(id: mcpRequestID, method: method, params: anyCodableParams)
-
-        let encodedRequestData: Data
+        let encodedRequest: Data
         do {
-            encodedRequestData = try self.jsonEncoder.encode(request)
-            // For debugging:
-            // print("MCPClient [Request ID: \(requestIDString)] Sending: \(String(data: encodedRequestData, encoding: .utf8) ?? "Non-UTF8 data")")
+            encodedRequest = try self.jsonEncoder.encode(rpcRequest)
         } catch {
-            // Encoding failed, no continuation stored yet, just throw.
-            throw MCPClientError.encodingError(description: "Failed to encode request for method \(method)", underlyingError: error)
+            // This error occurs if encoding the request itself fails.
+            throw MCPClientError.requestEncodingFailed(error)
         }
 
+        // Create a continuation for this request.
         return try await withCheckedThrowingContinuation { continuation in
             let pendingRequest = PendingRequest(continuation: continuation as! CheckedContinuation<Any, Error>, responseType: ResultType.self)
             self.pendingRequests[requestIDString] = pendingRequest
@@ -505,15 +508,15 @@ public actor MCPClient {
                     // Ensure client is connected before sending. Transport is non-optional.
                     guard self.connectionState == .connected else {
                         if self.pendingRequests.removeValue(forKey: requestIDString) != nil {
-                            (continuation as! CheckedContinuation<ResultType, Error>).resume(throwing: MCPClientError.clientNotConnected)
+                            continuation.resume(throwing: MCPClientError.notConnected)
                         }
                         return
                     }
-                    try await self.transport.send(encodedRequestData)
+                    try await self.transport.send(encodedRequest)
                 } catch {
                     // Transport failed to send. Remove pending request and resume continuation with error.
                     if self.pendingRequests.removeValue(forKey: requestIDString) != nil {
-                        (continuation as! CheckedContinuation<ResultType, Error>).resume(throwing: error)
+                        continuation.resume(throwing: error)
                     }
                 }
             }
@@ -523,7 +526,7 @@ public actor MCPClient {
     // MARK: - Message Dispatch/Session Layer
 
     /// Starts a task to listen for and process incoming messages from the transport.
-    private func startListeningToTransportInternal() { // Renamed from startListeningToTransport
+    private func startListeningToTransportInternal() {
         // Transport is non-optional, so no need to guard for its existence here.
         // Ensure any existing task is cancelled before starting a new one.
         messageProcessingTask?.cancel()
@@ -536,13 +539,15 @@ public actor MCPClient {
                     // print("MCPClient RECV: \(String(data: data, encoding: .utf8) ?? "")")
                     await self.handleIncomingData(data) // Actor re-entrancy ensures sequential processing
                 }
+                // This ensures the catch block is reachable if the loop exits without an error
+                try Task.checkCancellation()
             } catch {
                 if Task.isCancelled {
                     print("MCPClient: Message processing task cancelled normally.")
                 } else {
                     print("MCPClient: Message processing task ended with error - \(error)")
                     // Handle transport errors, e.g., by attempting to reconnect or transitioning to a disconnected state.
-                    await self.disconnect(reason: .transportError(error)) // Pass the specific error
+                    await self.disconnect(triggeredByError: error) // Pass the specific error
                 }
             }
             print("MCPClient: Message processing task finished.")
@@ -550,7 +555,7 @@ public actor MCPClient {
     }
 
     /// Stops the task that listens for incoming messages.
-    private func stopListeningToTransportInternal() { // Renamed from stopListeningToTransport
+    private func stopListeningToTransportInternal() {
         print("MCPClient: Stopping message processing task.")
         messageProcessingTask?.cancel()
         messageProcessingTask = nil
@@ -575,35 +580,35 @@ public actor MCPClient {
         // 1. Check for Response (id is present, and result or error is present)
         if let id = baseMessage.id, (baseMessage.result != nil || baseMessage.error != nil) {
             // This is a Response to a client-initiated request
-            guard let pending = self.pendingRequests.removeValue(forKey: id.stringValue) else { // Assuming RequestId has stringValue or similar
-                print("MCPClient Error: Received response for unknown request ID: \(id.stringValue). Discarding. Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
-                // Log MCPClientError.unknownRequestID(id.stringValue) if you have a logging mechanism
+            guard let pending = self.pendingRequests.removeValue(forKey: id.asString) else {
+                print("MCPClient Error: Received response for unknown request ID: \(id.asString). Discarding. Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
+                // Log MCPClientError.unknownRequestID(id.asString) if you have a logging mechanism
                 return
             }
 
             if let errorObject = baseMessage.error {
                 // Server returned an error
-                print("MCPClient: Received error response for ID \(id.stringValue): \(errorObject.code) - \(errorObject.message)")
+                print("MCPClient: Received error response for ID \(id.asString): \(errorObject.code) - \(errorObject.message)")
                 let mcpError = MCPClientError.jsonRpcError(errorObject)
-                (pending.continuation as! CheckedContinuation<AnyDecodable, MCPClientError>).resume(throwing: mcpError) // Cast to specific error type if not Any
+                pending.continuation.resume(throwing: mcpError)
             } else if let resultObject = baseMessage.result {
                 // Server returned a successful result
                 do {
                     // The resultObject is AnyCodable. We need to decode it into the specific PendingRequest.responseType.
                     let resultData = try self.jsonEncoder.encode(resultObject) // Re-encode AnyCodable to Data
                     let typedResult = try self.jsonDecoder.decode(pending.responseType, from: resultData) // Decode to expected type
-                    // print("MCPClient: Successfully decoded result for ID \(id.stringValue) to type \(pending.responseType)")
+                    // print("MCPClient: Successfully decoded result for ID \(id.asString) to type \(pending.responseType)")
                     pending.continuation.resume(returning: typedResult)
                 } catch {
-                    print("MCPClient Error: Failed to decode result for request ID \(id.stringValue) into type \(pending.responseType). Error: \(error). Result data: \(String(describing: baseMessage.result))")
-                    let mcpError = MCPClientError.decodingError(description: "Failed to decode result for request ID: \(id.stringValue) into \(pending.responseType)", underlyingError: error)
-                    (pending.continuation as! CheckedContinuation<AnyDecodable, MCPClientError>).resume(throwing: mcpError)
+                    print("MCPClient Error: Failed to decode result for request ID \(id.asString) into type \(pending.responseType). Error: \(error). Result data: \(String(describing: baseMessage.result))")
+                    let mcpError = MCPClientError.typeCastingFailed(expectedType: String(describing: pending.responseType), actualValueDescription: "AnyCodable result") // Corrected error case and parameters
+                    pending.continuation.resume(throwing: mcpError)
                 }
             } else {
                 // Should not happen if id is present and it's a response (violates JSON-RPC spec if neither result nor error)
-                print("MCPClient Error: Received response for ID \(id.stringValue) with no result or error. Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
-                let mcpError = MCPClientError.invalidMessageFormat(description: "Response for ID \(id.stringValue) had neither result nor error.")
-                (pending.continuation as! CheckedContinuation<AnyDecodable, MCPClientError>).resume(throwing: mcpError)
+                print("MCPClient Error: Received response for ID \(id.asString) with no result or error. Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
+                let mcpError = MCPClientError.unexpectedMessageFormat // Corrected error case
+                pending.continuation.resume(throwing: mcpError)
             }
 
         // 2. Check for Notification (method is present, id is ABSENT)
@@ -612,7 +617,7 @@ public actor MCPClient {
             // print("MCPClient: Received notification for method \(methodName)")
             do {
                 // Decode the full notification including params
-                let notification = try self.jsonDecoder.decode(JSONRPCNotification<AnyCodable>.self, from: data)
+                let notification = try self.jsonDecoder.decode(MCPSchema.JSONRPCNotification.self, from: data)
                 await self.dispatchNotification(notification)
             } catch {
                 print("MCPClient Error: Failed to decode notification for method \(methodName). Error: \(error). Data: \(String(data: data, encoding: .utf8) ?? "Invalid UTF8")")
@@ -622,12 +627,12 @@ public actor MCPClient {
         // 3. Check for Server-Initiated Request (method is present, id is present, AND no result/error)
         } else if let methodName = baseMessage.method, let requestID = baseMessage.id, baseMessage.result == nil && baseMessage.error == nil {
             // This is a Server-Initiated Request to the Client
-            // print("MCPClient: Received server-initiated request (ID: \(requestID.stringValue), Method: \(methodName))")
+            // print("MCPClient: Received server-initiated request (ID: \(requestID.asString), Method: \(methodName))")
             do {
-                let serverRequest = try self.jsonDecoder.decode(Schema.JSONRPCRequest.self, from: data)
+                let serverRequest = try self.jsonDecoder.decode(MCPSchema.JSONRPCRequest.self, from: data)
                 await self.dispatchServerRequest(serverRequest)
             } catch {
-                print("MCPClient Error: Failed to decode server-initiated request (ID: \(requestID.stringValue), Method: \(methodName)). Error: \(error). Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
+                print("MCPClient Error: Failed to decode server-initiated request (ID: \(requestID.asString), Method: \(methodName)). Error: \(error). Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
                 // Optionally, try to send a parse error response if requestID was parsable
                 // let errorResponse = JSONRPCResponse(id: requestID, error: JSONRPCErrorObject.parseError(message: "Failed to parse server request: \(error.localizedDescription)"))
                 // try? await self.sendRawResponse(errorResponse)
@@ -641,8 +646,10 @@ public actor MCPClient {
 
     // MARK: - Notification and Server Request Dispatchers
 
-    private func dispatchNotification(_ notification: JSONRPCNotification<AnyCodable>) async {
-        // print("MCPClient: Dispatching notification: \(notification.method)")
+    private func dispatchNotification(_ notification: MCPSchema.JSONRPCNotification) async {
+        // Example: Dispatch based on method name
+        // You would typically have a dictionary of handlers or a switch statement here.
+        // For now, just logging.
         switch notification.method {
         case "logging/message":
             do {
@@ -664,58 +671,71 @@ public actor MCPClient {
         }
     }
 
-    private func dispatchServerRequest(_ request: Schema.JSONRPCRequest) async {
-        // print("MCPClient: Dispatching server request: \(request.method), ID: \(request.id.stringValue)")
+    private func dispatchServerRequest(_ request: MCPSchema.JSONRPCRequest) async {
+        // print("MCPClient: Dispatching server request: \(request.method), ID: \(request.id.asString)")
         switch request.method {
-        case MCPMethods.Sampling.createMessage: // Ensure MCPMethods.Sampling.createMessage is defined
-            do {
-                // Assuming params for sampling/createMessage are of type SamplingCreateMessageParams
-                await self.handleSamplingCreateMessageRequest(id: request.id, params: request.params) // Pass AnyCodable params
-            } catch {
-                print("MCPClient Error: Failed to decode params for '\(request.method)' request. ID: \(request.id.stringValue). Error: \(error)")
-                let errorDetail = Schema.JSONRPCError.ErrorObject(code: -32602, message: "Invalid params for \(request.method): \(error.localizedDescription)")
-                let errorResponse = Schema.JSONRPCError(id: request.id, error: errorDetail)
-                await self.sendRawResponse(errorResponse)
+        case Constants.MCPMethods.Sampling.createMessage: // Ensure MCPMethods.Sampling.createMessage is defined
+            guard let actualParams = request.params else {
+                print("MCPClient Error: Missing params for '\(request.method)' request. ID: \(request.id.asString).")
+                let errorDetail = MCPSchema.JSONRPCError.ErrorObject(code: -32602, message: "Missing params for method '\(request.method)'")
+                let mcpError = MCPSchema.JSONRPCError(id: request.id, error: errorDetail)
+                await self.sendRawError(mcpError) // Changed to sendRawError
+                return
             }
+            await self.handleSamplingCreateMessageRequest(id: request.id, params: actualParams)
+
         // Add more cases for other server-initiated requests
         default:
-            print("MCPClient Warning: Received server-initiated request for unknown method: \(request.method). ID: \(request.id.stringValue)")
-            let errorDetail = Schema.JSONRPCError.ErrorObject(code: -32601, message: "Method not found: \(request.method)")
-            let errorResponse = Schema.JSONRPCError(id: request.id, error: errorDetail)
-            await self.sendRawResponse(errorResponse)
+            print("MCPClient Warning: Received server-initiated request for unknown method: \(request.method). ID: \(request.id.asString)")
+            let errorDetail = MCPSchema.JSONRPCError.ErrorObject(code: -32601, message: "Method not found: \(request.method)")
+            let mcpError = MCPSchema.JSONRPCError(id: request.id, error: errorDetail)
+            await self.sendRawError(mcpError) // Changed to sendRawError
         }
     }
 
     /// Specific handler for 'sampling/createMessage' server-initiated request.
     private func handleSamplingCreateMessageRequest(id: RequestId, params: AnyCodable) async {
         guard let appHandler = self.onSamplingCreateMessage else {
-            print("MCPClient: '\(MCPMethods.Sampling.createMessage)' request received, but no onSamplingCreateMessage handler is set.")
-            let errorDetail = Schema.JSONRPCError.ErrorObject(code: -32601, message: "Method not found (handler not configured on client): \(MCPMethods.Sampling.createMessage)")
-            let errorResponse = Schema.JSONRPCError(id: id, error: errorDetail)
-            await self.sendRawResponse(errorResponse)
+            print("MCPClient: '\(Constants.MCPMethods.Sampling.createMessage)' request received, but no onSamplingCreateMessage handler is set.")
+            let errorDetail = MCPSchema.JSONRPCError.ErrorObject(code: -32601, message: "Method not found (handler not configured on client): \(Constants.MCPMethods.Sampling.createMessage)")
+            let mcpError = MCPSchema.JSONRPCError(id: id, error: errorDetail)
+            await self.sendRawError(mcpError) // Changed to sendRawError
             return
         }
 
         do {
+            // Decode params from AnyCodable to the specific type expected by the handler
+            let typedParams: CreateMessageRequest.Params = try decodeParams(params, as: CreateMessageRequest.Params.self)
             // Assuming the handler returns a result that can be encoded into AnyCodable for the response.
-            let result: AnyCodable = try await appHandler(params) // Adjust based on actual handler signature
-            let response = Schema.JSONRPCResponse(id: id, result: result) // For successful response
+            let actualResult = try await appHandler(typedParams) // appHandler now takes typedParams
+            let resultAsAnyCodable = AnyCodable(actualResult) // Encode result to AnyCodable
+            let response = MCPSchema.JSONRPCResponse(id: id, result: resultAsAnyCodable) // For successful response
             await self.sendRawResponse(response)
         } catch {
-            print("MCPClient: Application handler for '\(MCPMethods.Sampling.createMessage)' (ID: \(id.stringValue)) threw an error: \(error.localizedDescription)")
-            let errorDetail = Schema.JSONRPCError.ErrorObject(code: -32603, message: "Internal error in application handler for '\(MCPMethods.Sampling.createMessage)': \(error.localizedDescription)")
-            let errorResponse = Schema.JSONRPCError(id: id, error: errorDetail)
-            await self.sendRawResponse(errorResponse)
+            print("MCPClient: Application handler for '\(Constants.MCPMethods.Sampling.createMessage)' (ID: \(id.asString)) threw an error: \(error.localizedDescription)")
+            let errorDetail = MCPSchema.JSONRPCError.ErrorObject(code: -32603, message: "Internal error in application handler for '\(Constants.MCPMethods.Sampling.createMessage)': \(error.localizedDescription)")
+            let mcpError = MCPSchema.JSONRPCError(id: id, error: errorDetail)
+            await self.sendRawError(mcpError) // Changed to sendRawError
         }
     }
 
     /// Helper to send a pre-constructed JSONRPCResponse (typically an error response for server requests).
-    private func sendRawResponse<T: Encodable, E: Encodable>(_ response: JSONRPCResponse<T, E>) async {
+    private func sendRawResponse(_ response: MCPSchema.JSONRPCResponse) async { // For successful responses
         do {
             let encodedResponse = try self.jsonEncoder.encode(response)
             try await self.transport.send(encodedResponse)
         } catch {
-            print("MCPClient Error: Failed to encode or send raw response for ID \(response.id.stringValue). Error: \(error)")
+            print("MCPClient Error: Failed to encode or send raw response for ID \(response.id.asString). Error: \(error)")
+        }
+    }
+
+    /// Helper to send a pre-constructed JSONRPCError.
+    private func sendRawError(_ errorResponse: MCPSchema.JSONRPCError) async { // For error responses
+        do {
+            let encodedError = try self.jsonEncoder.encode(errorResponse)
+            try await self.transport.send(encodedError)
+        } catch {
+            print("MCPClient Error: Failed to encode or send raw error for ID \(errorResponse.id.asString). Error: \(error)")
         }
     }
 
@@ -726,7 +746,7 @@ public actor MCPClient {
             // If T itself is Optional, this might be fine. If T is non-optional, this is an error.
             // For simplicity, let's assume if params are expected, anyCodableParams shouldn't be nil.
             // Or, T could be an optional type itself e.g. MyParamsType?
-            throw MCPClientError.decodingError(description: "Expected parameters of type \(String(describing: T.self)) but received nil AnyCodable.", underlyingError: nil)
+            throw MCPClientError.typeCastingFailed(expectedType: String(describing: T.self), actualValueDescription: "nil AnyCodable parameters") // Changed to typeCastingFailed
         }
         let paramsData = try self.jsonEncoder.encode(params) // Re-encode AnyCodable to Data
         return try self.jsonDecoder.decode(T.self, from: paramsData) // Decode to expected type
@@ -765,7 +785,7 @@ public actor MCPClient {
     }
 
     private func startHeartbeatIfNeeded() async {
-        guard let interval = self.heartbeatInterval, interval > 0, isPersistentTransport(), self.connectionState == .connected else {
+        guard let interval = self.heartbeatInterval, interval > 0, isPersistentTransport(), self.connectionState == .connected else { 
             // print("MCPClient: Heartbeat not started. Interval: \(String(describing: heartbeatInterval)), Persistent: \(isPersistentTransport()), State: \(connectionState)")
             return
         }
@@ -779,23 +799,28 @@ public actor MCPClient {
             while !Task.isCancelled {
                 // Check connection state before sleeping and before pinging
                 // This ensures that if disconnect happens while sleeping, we don't ping.
-                guard await self.connectionState == .connected else {
+                guard await self.connectionState == .connected else { 
                     print("MCPClient: Heartbeat: No longer connected, stopping.")
                     break
                 }
 
                 do {
-                    try await Task.sleep(for: .seconds(interval))
+                    // Ensure client is connected before sending. Transport is non-optional.
+                    guard await self.connectionState == .connected else { 
+                        print("MCPClient: Heartbeat: Not connected, stopping.")
+                        break
+                    }
+                    try await Task.sleep(for: .seconds(interval)) // Ensure await is here
                     
                     // Re-check cancellation and connection state after sleep
                     if Task.isCancelled { break }
-                    guard await self.connectionState == .connected else {
+                    guard await self.connectionState == .connected else { 
                         print("MCPClient: Heartbeat: No longer connected after sleep, stopping.")
                         break
                     }
                     
                     print("MCPClient: Heartbeat: Sending ping...")
-                    try await self.performPing()
+                    try await self.performPing() // Ensure await is here
                 } catch is CancellationError {
                     print("MCPClient: Heartbeat task cancelled.")
                     break
@@ -820,7 +845,7 @@ public actor MCPClient {
         }
     }
 
-    private func stopHeartbeat() async { // Made async to align if needed, though current ops are sync
+    private func stopHeartbeat() async {
         if heartbeatTask != nil {
             print("MCPClient: Stopping heartbeat task.")
             heartbeatTask?.cancel()
@@ -836,7 +861,7 @@ public actor MCPClient {
         //    _ = try await self.sendRequest(method: "mcp/ping", params: NoParams(), responseType: NoResult.self)
         // }
         print("MCPClient: performPing() called")
-        _ = try await self.sendRequest(method: "mcp/ping", params: NoParams(), responseType: NoResult.self)
+        let _: NoResult = try await self.sendRequest(method: "mcp/ping", params: NoParams()) // Corrected call with type annotation
         print("MCPClient: Ping successful.")
     }
 
@@ -844,8 +869,8 @@ public actor MCPClient {
 
     private func handleConnectionFailure(error: Error) async {
         // Ensure this is only processed if we are in a state that expects a connection.
-        guard connectionState == .connected || connectionState == .connecting else {
-            print("MCPClient: handleConnectionFailure called in state \(connectionState) with error \(error). Ignoring as not connected/connecting.")
+        guard self.connectionState == .connected || self.connectionState == .connecting else { 
+            print("MCPClient: handleConnectionFailure called in state \(self.connectionState) with error \(error). Ignoring as not connected/connecting.")
             return
         }
         
@@ -960,7 +985,7 @@ public actor MCPClient {
                 // 2. Reset currentReconnectAttempt = 0.
                 // So, this loop should effectively terminate if connect() is successful.
                 // We add an explicit check for .connected state to break, though cancellation is primary exit.
-                if await self.connectionState == .connected {
+                if self.connectionState == .connected {
                     print("MCPClient: Reconnection successful on attempt \(currentReconnectAttempt). Loop should terminate via cancellation.")
                     // The task will be cancelled by cancelReconnectionAttempt called from connectionStateDidChange.
                     // No need to break explicitly if cancellation is reliable.
@@ -975,7 +1000,7 @@ public actor MCPClient {
             } catch {
                 // This catch block handles errors from self.connect(isRetryAttempt: true)
                 // connect() itself should set the state to .disconnected(error: connectError)
-                print("MCPClient: Reconnect attempt \(currentReconnectAttempt) failed: \(error). State is \(await self.connectionState). Will retry if attempts remain.")
+                print("MCPClient: Reconnect attempt \(currentReconnectAttempt) failed: \(error). State is \(self.connectionState). Will retry if attempts remain.")
                 // Loop will continue if attempts remain and task not cancelled.
             }
         }

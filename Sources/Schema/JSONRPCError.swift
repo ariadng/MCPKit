@@ -6,7 +6,7 @@ public struct JSONRPCError: Codable {
     public var id: RequestId
     public var error: ErrorObject
     
-    public struct ErrorObject: Codable {
+    public struct ErrorObject: Codable, @unchecked Sendable {
         /**
          * The error type that occurred.
          */

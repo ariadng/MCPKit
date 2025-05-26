@@ -4,15 +4,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "MCPKit",
+    name: "MCP",
     platforms: [
         .macOS(.v13) // Specify macOS platform version
     ],
     products: [
         // Library product for the MCPKit framework
         .library(
-            name: "MCPKit",
-            targets: ["MCPKitLibrary"]),
+            name: "MCP",
+            targets: ["MCPLibrary"]),
         // Executable product for the CLI tool
         .executable(
             name: "mcpkit",
@@ -25,41 +25,55 @@ let package = Package(
     targets: [
         // --- Core Library Targets ---
         .target(
-            name: "MCPKitUtils",
+            name: "MCPUtils",
             path: "Sources/Utils"
         ),
         .target(
-            name: "MCPKitCore",
-            dependencies: ["MCPKitUtils"],
-            path: "Sources/Core"
+            name: "MCPSchema",
+            dependencies: ["MCPUtils"], 
+            path: "Sources/Schema"
         ),
         .target(
-            name: "MCPKitTransport",
-            dependencies: ["MCPKitCore", "MCPKitUtils"],
+            name: "MCPTransport",
+            dependencies: ["MCPUtils"],
             path: "Sources/Transport"
         ),
         .target(
-            name: "MCPKitServer",
-            dependencies: ["MCPKitCore", "MCPKitTransport", "MCPKitUtils"],
+            name: "MCPClient",
+            dependencies: [
+                "MCPSchema",
+                "MCPTransport",
+                "MCPUtils"
+            ],
+            path: "Sources/MCPClient"
+        ),
+        .target(
+            name: "MCPServer",
+            dependencies: [
+                "MCPSchema", 
+                "MCPTransport",
+                "MCPUtils"
+            ],
             path: "Sources/Server"
         ),
         // Main library target that aggregates other library components
         .target(
-            name: "MCPKitLibrary",
+            name: "MCPLibrary",
             dependencies: [
-                "MCPKitCore",
-                "MCPKitTransport",
-                "MCPKitServer",
-                "MCPKitUtils"
+                "MCPClient",   
+                "MCPSchema",   
+                "MCPTransport",
+                "MCPServer",
+                "MCPUtils"
             ],
-            path: "Sources/MCPKit" // Using the directory created by 'swift package init'
+            path: "Sources/MCPKit" 
         ),
 
         // --- CLI Target ---
         .executableTarget(
             name: "CLI",
             dependencies: [
-                "MCPKitLibrary",
+                "MCPLibrary",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
             path: "Sources/CLI"
@@ -67,8 +81,8 @@ let package = Package(
 
         // --- Test Target ---
         .testTarget(
-            name: "MCPKitTests",
-            dependencies: ["MCPKitLibrary"]
+            name: "MCPTests",
+            dependencies: ["MCPLibrary"]
         ),
     ]
 )

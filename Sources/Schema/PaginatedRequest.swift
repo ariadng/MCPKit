@@ -2,7 +2,7 @@
  * Base interface for paginated requests.
  */
 public protocol PaginatedRequest {
-    var params: RequestParams? { get }
+    var params: RequestParams? { get set }
 }
 
 public extension PaginatedRequest {
@@ -11,12 +11,15 @@ public extension PaginatedRequest {
      * If provided, the server should return results starting after this cursor.
      */
     var cursor: Cursor? {
-        if let params = self.params,
-           let cursorValue = params["cursor"],
-           case let .string(cursor) = cursorValue {
-            return cursor
+        guard let paramsDict = self.params, // Unwraps self.params to [String: AnyCodable]
+              let anyCodableCursor = paramsDict["cursor"] // Unwraps the value from dict to AnyCodable
+        else {
+            return nil // If params is nil or "cursor" key doesn't exist
         }
-        return nil
+        // anyCodableCursor is of type AnyCodable
+        // Attempt to decode it to String. If it's not a string or represents JSON null,
+        // try? will result in nil.
+        return try? anyCodableCursor.decode(to: String.self)
     }
     
     mutating func setCursor(_ cursor: Cursor?) {

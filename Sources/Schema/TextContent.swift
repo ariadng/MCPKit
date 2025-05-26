@@ -1,7 +1,7 @@
 /**
  * Text provided to or from an LLM.
  */
-public struct TextContent: Codable {
+public struct TextContent: Codable, Sendable {
     public var type: String = "text"
     
     /**

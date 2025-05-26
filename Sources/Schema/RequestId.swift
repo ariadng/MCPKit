@@ -27,4 +27,14 @@ public enum RequestId: Codable, Hashable {
             try container.encode(value)
         }
     }
+    
+    /// Provides a string representation of the RequestId.
+    public var asString: String {
+        switch self {
+        case .string(let s):
+            return s
+        case .number(let n):
+            return String(n)
+        }
+    }
 }

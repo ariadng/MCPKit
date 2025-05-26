@@ -6,8 +6,8 @@
 //
 
 import Foundation
-import Schema
-// Assumes AnyCodable and JSONRPCErrorObject from Schema are available in the same target.
+import MCPSchema
+// Assumes AnyCodable and JSONRPCErrorObject from MCPSchema are available in the same target.
 
 /// Custom errors specific to MCPClient operations.
 public enum MCPClientError: Error, Equatable {
@@ -19,14 +19,15 @@ public enum MCPClientError: Error, Equatable {
     case serverError(code: Int, message: String, data: AnyCodable?) // Assuming AnyCodable for flexible error data
     case unexpectedMessageFormat
     case continuationNotFound(id: String)
-    case typeCastingFailed(expectedType: String, actualValue: Any)
-    case jsonRpcError(Schema.JSONRPCError.ErrorObject) // Corrected to use type from Schema
+    case typeCastingFailed(expectedType: String, actualValueDescription: String)
+    case jsonRpcError(MCPSchema.JSONRPCError.ErrorObject) // Corrected to use type from MCPSchema
     case transportNotAvailable
     case alreadyConnected
     case notImplemented
     case handshakeFailed(underlyingError: Error)
     case pingFailed(underlyingError: Error)
     case maxReconnectAttemptsReached
+    case operationCancelled // New case for cancelled operations
 
     public static func == (lhs: MCPClientError, rhs: MCPClientError) -> Bool {
         switch (lhs, rhs) {
@@ -45,17 +46,17 @@ public enum MCPClientError: Error, Equatable {
             return String(describing: lError) == String(describing: rError)
         case (.unsolicitedResponse(let lId), .unsolicitedResponse(let rId)):
             return lId == rId
-        case (.serverError(let lErrorObj), .serverError(let rErrorObj)):
-            return lErrorObj.code == rErrorObj.code && lErrorObj.message == rErrorObj.message && lErrorObj.data == rErrorObj.data
+        case (.serverError(let lCode, let lMessage, let lData), .serverError(let rCode, let rMessage, let rData)):
+            return lCode == rCode && lMessage == rMessage && lData == rData
         case (.unexpectedMessageFormat, .unexpectedMessageFormat):
             return true
         case (.continuationNotFound(let lId), .continuationNotFound(let rId)):
             return lId == rId
-        case (.typeCastingFailed(let lExpectedType, let lActualValue), .typeCastingFailed(let rExpectedType, let rActualValue)):
+        case (.typeCastingFailed(let lExpectedType, let lActualValueDesc), .typeCastingFailed(let rExpectedType, let rActualValueDesc)):
             // Basic comparison for simplicity
-            return lExpectedType == rExpectedType && String(describing: lActualValue) == String(describing: rActualValue)
+            return lExpectedType == rExpectedType && lActualValueDesc == rActualValueDesc
         case (.jsonRpcError(let lObj), .jsonRpcError(let rObj)):
-            // Compare based on Schema.JSONRPCError.ErrorObject fields
+            // Compare based on MCPSchema.JSONRPCError.ErrorObject fields
             return lObj.code == rObj.code && lObj.message == rObj.message && String(describing: lObj.data) == String(describing: rObj.data)
         case (.transportNotAvailable, .transportNotAvailable):
             return true
@@ -68,6 +69,8 @@ public enum MCPClientError: Error, Equatable {
             // Basic Error comparison by description for simplicity
             return String(describing: lError) == String(describing: rError)
         case (.maxReconnectAttemptsReached, .maxReconnectAttemptsReached):
+            return true
+        case (.operationCancelled, .operationCancelled):
             return true
         default:
             return false

@@ -1,7 +1,7 @@
 /**
  * An image provided to or from an LLM.
  */
-public struct ImageContent: Codable {
+public struct ImageContent: Codable, Sendable {
     public var type: String = "image"
     
     /**

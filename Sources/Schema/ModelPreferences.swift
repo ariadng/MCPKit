@@ -11,7 +11,7 @@
  * up to the client to decide how to interpret these preferences and how to
  * balance them against other considerations.
  */
-public struct ModelPreferences: Codable {
+public struct ModelPreferences: Codable, Sendable {
     /**
      * Hints to use for model selection.
      */

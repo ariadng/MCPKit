@@ -15,3 +15,22 @@ public enum Constants {
     public static let INVALID_PARAMS = -32602
     public static let INTERNAL_ERROR = -32603
 }
+
+public extension Constants {
+    enum MCPMethods {
+        public enum Sampling {
+            /// Method name for a server to request the client to create a message in a sampling context.
+            public static let createMessage = "sampling/createMessage"
+        }
+        // Future MCP method groups can be added here, for example:
+        // public enum General {
+        //     public static let initialize = "initialize"
+        //     public static let initialized = "initialized"
+        //     public static let shutdown = "shutdown"
+        //     public static let exit = "exit"
+        // }
+        // public enum Workspace {
+        //     public static let listRoots = "workspace/listRoots"
+        // }
+    }
+}

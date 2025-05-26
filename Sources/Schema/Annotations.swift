@@ -1,7 +1,7 @@
 /**
  * Optional annotations for the client. The client can use annotations to inform how objects are used or displayed
  */
-public struct Annotations: Codable {
+public struct Annotations: Codable, Sendable {
     /**
      * Describes who the intended customer of this object or data is.
      *

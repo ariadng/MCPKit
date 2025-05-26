@@ -1,7 +1,7 @@
 /**
  * Describes a message issued to or received from an LLM API.
  */
-public struct SamplingMessage: Codable {
+public struct SamplingMessage: Codable, Sendable {
     public var role: Role
     public var content: MessageContent
     
@@ -10,7 +10,7 @@ public struct SamplingMessage: Codable {
         self.content = content
     }
     
-    public enum MessageContent: Codable {
+    public enum MessageContent: Codable, Sendable {
         case text(TextContent)
         case image(ImageContent)
         case audio(AudioContent)
@@ -47,3 +47,6 @@ public struct SamplingMessage: Codable {
         }
     }
 }
+
+// Reverted: Removed placeholder definitions for TextContent, ImageContent, AudioContent.
+// These types are defined elsewhere and need to be made Sendable in their respective files.

@@ -1,3 +1,5 @@
+import Foundation
+
 /**
  * This notification can be sent by either side to indicate that it is cancelling a previously-issued request.
  *
@@ -35,7 +37,7 @@ public struct CancelledNotification: Notification, Codable {
         if let data = try? encoder.encode(params),
            let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let jsonData = try? JSONSerialization.data(withJSONObject: jsonObject),
-           let anyCodable = try? JSONDecoder().decode(AnyCodable.self, from: jsonData) {
+           (try? JSONDecoder().decode(AnyCodable.self, from: jsonData)) != nil {
             var notificationParams = NotificationParams()
             for (key, value) in jsonObject {
                 notificationParams[key] = AnyCodable(value)

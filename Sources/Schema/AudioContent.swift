@@ -1,7 +1,7 @@
 /**
  * Audio provided to or from an LLM.
  */
-public struct AudioContent: Codable {
+public struct AudioContent: Codable, Sendable {
     public var type: String = "audio"
     
     /**

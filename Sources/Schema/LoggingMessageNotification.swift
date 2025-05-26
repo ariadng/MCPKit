@@ -1,3 +1,5 @@
+import Foundation
+
 /**
  * Notification of a log message passed from server to client. If no logging/setLevel request has been sent from the client, the server MAY decide which messages to send automatically.
  */
@@ -33,7 +35,7 @@ public struct LoggingMessageNotification: Notification, Codable {
         if let data = try? encoder.encode(params),
            let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let jsonData = try? JSONSerialization.data(withJSONObject: jsonObject),
-           let anyCodable = try? JSONDecoder().decode(AnyCodable.self, from: jsonData) {
+           (try? JSONDecoder().decode(AnyCodable.self, from: jsonData)) != nil {
             var notificationParams = NotificationParams()
             for (key, value) in jsonObject {
                 notificationParams[key] = AnyCodable(value)

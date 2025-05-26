@@ -1,3 +1,5 @@
+import Foundation
+
 /**
  * An out-of-band notification used to inform the receiver of a progress update for a long-running request.
  */
@@ -39,7 +41,7 @@ public struct ProgressNotification: Notification, Codable {
         if let data = try? encoder.encode(params),
            let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let jsonData = try? JSONSerialization.data(withJSONObject: jsonObject),
-           let anyCodable = try? JSONDecoder().decode(AnyCodable.self, from: jsonData) {
+           (try? JSONDecoder().decode(AnyCodable.self, from: jsonData)) != nil {
             var notificationParams = NotificationParams()
             for (key, value) in jsonObject {
                 notificationParams[key] = AnyCodable(value)

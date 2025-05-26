@@ -1,3 +1,5 @@
+import Foundation
+
 /**
  * A request from the client to the server, to ask for completion options.
  */
@@ -77,7 +79,7 @@ public struct CompleteRequest: Request, Codable {
         if let data = try? encoder.encode(params),
            let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let jsonData = try? JSONSerialization.data(withJSONObject: jsonObject),
-           let anyCodable = try? JSONDecoder().decode(AnyCodable.self, from: jsonData) {
+           (try? JSONDecoder().decode(AnyCodable.self, from: jsonData)) != nil {
             var requestParams = RequestParams()
             for (key, value) in jsonObject {
                 requestParams[key] = AnyCodable(value)

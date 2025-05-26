@@ -1,3 +1,5 @@
+import Foundation
+
 /**
  * A request from the server to sample an LLM via the client. The client has full discretion over which model to select. 
  * The client should also inform the user before beginning sampling, to allow them to inspect the request (human in the loop) and decide whether to approve it.
@@ -6,7 +8,7 @@ public struct CreateMessageRequest: Request, Codable {
     public var method: String = "sampling/createMessage"
     public var params: RequestParams?
     
-    public struct Params: Codable {
+    public struct Params: Codable, Sendable {
         public var messages: [SamplingMessage]
         
         /**
@@ -44,7 +46,7 @@ public struct CreateMessageRequest: Request, Codable {
          */
         public var metadata: AnyCodable?
         
-        public enum IncludeContext: String, Codable {
+        public enum IncludeContext: String, Codable, Sendable {
             case none = "none"
             case thisServer = "thisServer"
             case allServers = "allServers"
@@ -76,7 +78,7 @@ public struct CreateMessageRequest: Request, Codable {
         if let data = try? encoder.encode(params),
            let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let jsonData = try? JSONSerialization.data(withJSONObject: jsonObject),
-           let anyCodable = try? JSONDecoder().decode(AnyCodable.self, from: jsonData) {
+           (try? JSONDecoder().decode(AnyCodable.self, from: jsonData)) != nil {
             var requestParams = RequestParams()
             for (key, value) in jsonObject {
                 requestParams[key] = AnyCodable(value)

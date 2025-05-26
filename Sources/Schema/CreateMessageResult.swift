@@ -2,7 +2,7 @@
  * The client's response to a sampling/create_message request from the server. 
  * The client should inform the user before returning the sampled message, to allow them to inspect the response (human in the loop) and decide whether to allow the server to see it.
  */
-public struct CreateMessageResult: Result, Codable {
+public struct CreateMessageResult: Result, Codable, Sendable {
     public var _meta: [String: AnyCodable]?
     public var role: Role
     public var content: SamplingMessage.MessageContent

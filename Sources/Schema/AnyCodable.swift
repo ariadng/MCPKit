@@ -2,7 +2,10 @@ import Foundation
 
 /// A type-erased wrapper that allows encoding and decoding of heterogeneous JSON values.
 /// This is particularly useful for fields in JSON structures that can contain values of any valid JSON type.
-public struct AnyCodable: Codable {
+/// - Note: This type is marked as `@unchecked Sendable`. It is the developer's responsibility to ensure that
+///   the underlying `value` is `Sendable` if `AnyCodable` instances are passed across actor boundaries.
+///   Standard JSON types (String, Int, Double, Bool, and collections of these) are `Sendable`.
+public struct AnyCodable: Codable, Equatable, @unchecked Sendable {
     private let value: Any
 
     /// Initializes `AnyCodable` with any value. If `nil` is provided, it's stored as an internal representation of null.
@@ -56,5 +59,47 @@ public struct AnyCodable: Codable {
         else if let array = try? container.decode([AnyCodable].self) { self.value = array.map { $0.value } } 
         else if let dictionary = try? container.decode([String: AnyCodable].self) { self.value = dictionary.mapValues { $0.value } }
         else { throw DecodingError.dataCorruptedError(in: container, debugDescription: "AnyCodable value cannot be decoded into any known JSON type.") }
+    }
+}
+
+extension AnyCodable {
+    public static func == (lhs: AnyCodable, rhs: AnyCodable) -> Bool {
+        switch (lhs.value, rhs.value) {
+        case (let l as String, let r as String):
+            return l == r
+        case (let l as Int, let r as Int):
+            return l == r
+        case (let l as Double, let r as Double):
+            return l == r
+        case (let l as Bool, let r as Bool):
+            return l == r
+        case (is (), is ()): // Both are nil
+            return true
+        case (let l as [AnyCodable], let r as [AnyCodable]):
+             return l == r
+        case (let l as [String: AnyCodable], let r as [String: AnyCodable]):
+             return l == r
+        // Attempt to compare arrays of other equatable types if necessary, e.g., [String], [Int]
+        // This basic implementation might need to be expanded for more complex scenarios
+        // or rely on a more robust underlying comparison if values are custom Equatable types.
+        default:
+            // Fallback: if types are different or not directly comparable with above, consider them not equal.
+            // For a more comprehensive equality, one might convert to Data and compare, or stringify.
+            // However, that can be lossy or inefficient.
+            // If one is nil and the other is not, they are not equal.
+            if (lhs.value is () && !(rhs.value is ())) || (!(lhs.value is ()) && rhs.value is ()) {
+                return false
+            }
+            // If types are different, they are not equal.
+            // This check is a bit simplistic as it relies on Swift's dynamic type checking.
+            if type(of: lhs.value) != type(of: rhs.value) {
+                return false
+            }
+            // As a last resort, if they are of the same type but not covered above, consider them unequal.
+            // This part is tricky without knowing all possible types.
+            // A more robust solution might involve trying to cast to specific Equatable types
+            // or using a library that handles deep equality for Any.
+            return false // Or a more sophisticated comparison if needed
+        }
     }
 }
