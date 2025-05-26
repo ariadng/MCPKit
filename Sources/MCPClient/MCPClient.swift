@@ -6,16 +6,56 @@
 //
 
 import Foundation
-// Assuming schema types are accessible from this module, e.g., part of the same target.
-// The MCPTransport protocol is now defined in Sources/Transport/MCPTransport.swift
+import Combine
+import Schema
 
 /// MCPClient is an actor responsible for managing communication with an MCP server.
 /// It handles JSON-RPC 2.0 session management, request sending, and response/notification processing.
 public actor MCPClient {
+    // MARK: - Nested ConnectionState Enum
+
+    /// Represents the connection state of the MCPClient.
+    public enum ConnectionState: Equatable {
+        case disconnected(error: Error? = nil)
+        case connecting
+        case connected
+        case disconnecting
+        case reconnecting(attempt: Int, nextAttemptIn: TimeInterval)
+
+        public static func == (lhs: MCPClient.ConnectionState, rhs: MCPClient.ConnectionState) -> Bool {
+            switch (lhs, rhs) {
+            case (.disconnected(let lError), .disconnected(let rError)):
+                // Consider errors equal if both are nil or both are non-nil (basic check)
+                // For more precise equality, one might compare error domains and codes.
+                return (lError == nil && rError == nil) || (lError != nil && rError != nil)
+            case (.connecting, .connecting):
+                return true
+            case (.connected, .connected):
+                return true
+            case (.disconnecting, .disconnecting):
+                return true
+            case (.reconnecting(let lAttempt, let lTime), .reconnecting(let rAttempt, let rTime)):
+                return lAttempt == rAttempt && lTime == rTime // Or close enough for TimeInterval
+            default:
+                return false
+            }
+        }
+    }
+
     // MARK: - Properties
 
     /// The current connection state of the client.
-    public private(set) var connectionState: ConnectionState = .disconnected(reason: .normal)
+    public var connectionState: ConnectionState = .disconnected(error: nil) {
+        didSet {
+            // Log state change
+            print("MCPClient: Connection state changed from \(oldValue) to \(connectionState)")
+            Task { // Ensure it runs on the actor's executor
+                await self.connectionStateDidChange(from: oldValue, to: connectionState)
+            }
+            // Notify observers if any (e.g., via a stream)
+            // connectionStateStreamContinuation?.yield(connectionState)
+        }
+    }
 
     /// The transport mechanism used for sending and receiving data.
     private let transport: MCPTransport
@@ -23,11 +63,21 @@ public actor MCPClient {
     /// Configuration for the transport, dictating which transport is used and its parameters.
     public let transportConfiguration: MCPTransportConfiguration
 
+    /// Optional interval for sending heartbeat pings.
+    private let heartbeatInterval: TimeInterval?
+
+    /// Configuration for automatic reconnection.
+    private let enableAutoReconnect: Bool
+    private let maxReconnectAttempts: Int
+    private let baseReconnectDelay: TimeInterval
+    private let maxReconnectDelay: TimeInterval
+    private let reconnectDelayJitterFactor: Double
+
     /// Capabilities of this client, to be sent during initialization.
     private let clientCapabilities: ClientCapabilities
 
     /// Capabilities reported by the server after successful initialization.
-    public private(set) var serverCapabilities: ServerCapabilities?
+    public private(set) var serverCapabilities: ServerCapabilities? = nil
 
     /// Stores pending requests awaiting a response from the server.
     /// Keyed by request ID.
@@ -47,6 +97,16 @@ public actor MCPClient {
 
     /// Task responsible for observing the transport's connection state changes.
     private var transportStateObservationTask: Task<Void, Never>?
+
+    /// Task responsible for sending periodic heartbeats.
+    private var heartbeatTask: Task<Void, Never>?
+
+    /// Task responsible for automatic reconnection attempts.
+    private var reconnectionTask: Task<Void, Never>?
+    private var currentReconnectAttempt: Int = 0
+
+    /// Flag to indicate if an MCP handshake is currently in progress.
+    private var handshakeInProgress: Bool = false
 
     // MARK: - Public Callbacks for Server-Initiated Messages
 
@@ -68,24 +128,46 @@ public actor MCPClient {
         let responseType: Decodable.Type
     }
 
-    /// A helper struct to decode the base fields of a JSON-RPC message
-    /// to determine if it's a response, notification, or server request.
     private struct JSONRPCMessageBase: Decodable {
         let id: RequestId?
         let method: String?
         let result: AnyCodable?
-        let error: JSONRPCErrorObject?
+        let error: Schema.JSONRPCError.ErrorObject? // Ensure this exact type
     }
+
+    // MARK: - Structures for Ping
+    private struct NoParams: Encodable {}
+    private struct NoResult: Decodable {}
 
     // MARK: - Initialization and Lifecycle
 
     /// Initializes a new MCPClient with a specific transport configuration and client capabilities.
     /// - Parameter transportConfiguration: The configuration specifying the transport to use.
     /// - Parameter clientCapabilities: The capabilities of this client.
+    /// - Parameter heartbeatInterval: Optional interval in seconds for sending heartbeat pings. Defaults to nil (disabled).
+    /// - Parameter enableAutoReconnect: Whether to enable automatic reconnection. Defaults to true.
+    /// - Parameter maxReconnectAttempts: Maximum number of reconnection attempts. Defaults to 5.
+    /// - Parameter baseReconnectDelay: Base delay in seconds for reconnection attempts. Defaults to 1.0.
+    /// - Parameter maxReconnectDelay: Maximum delay in seconds for reconnection attempts. Defaults to 30.0.
+    /// - Parameter reconnectDelayJitterFactor: Factor for introducing jitter in reconnection delays. Defaults to 0.25.
     /// - Throws: An error if the transport cannot be initialized (though current transport inits don't throw).
-    public init(transportConfiguration: MCPTransportConfiguration, clientCapabilities: ClientCapabilities) throws {
+    public init(transportConfiguration: MCPTransportConfiguration, 
+                clientCapabilities: ClientCapabilities, 
+                heartbeatInterval: TimeInterval? = nil,
+                enableAutoReconnect: Bool = true,
+                maxReconnectAttempts: Int = 5,
+                baseReconnectDelay: TimeInterval = 1.0,
+                maxReconnectDelay: TimeInterval = 30.0,
+                reconnectDelayJitterFactor: Double = 0.25
+    ) throws {
         self.transportConfiguration = transportConfiguration
-        self.clientCapabilities = clientCapabilities
+        self.clientCapabilities = clientCapabilities // Ensure clientCapabilities is initialized
+        self.heartbeatInterval = heartbeatInterval
+        self.enableAutoReconnect = enableAutoReconnect
+        self.maxReconnectAttempts = maxReconnectAttempts
+        self.baseReconnectDelay = baseReconnectDelay
+        self.maxReconnectDelay = maxReconnectDelay
+        self.reconnectDelayJitterFactor = reconnectDelayJitterFactor
 
         switch transportConfiguration {
         #if os(macOS)
@@ -106,144 +188,250 @@ public actor MCPClient {
         // Ensure tasks are cancelled on deinitialization, though explicit disconnect is preferred.
         messageProcessingTask?.cancel()
         transportStateObservationTask?.cancel()
+        heartbeatTask?.cancel()
+        reconnectionTask?.cancel()
         // If transport has a synchronous disconnect, call it here.
         // Otherwise, an explicit async disconnect method is better.
     }
 
-    /// Establishes a connection to the server using the configured transport.
-    public func connect() async throws {
-        // Guard against multiple concurrent connection attempts or connecting when already connected.
-        // Allow re-connection if disconnected (even with an error).
-        guard connectionState == .disconnected(reason: nil) || 
-              connectionState == .disconnected(reason: .normal) || 
-              isDisconnectedWithErrorInternal() || 
-              connectionState == .disconnecting else {
-            print("MCPClient: Already connected or in the process of connecting/disconnecting from a non-error state: \(connectionState).")
-            throw MCPClientError.alreadyConnected
+    /// Establishes a connection to the server using the configured transport and performs MCP handshake.
+    /// This includes establishing the transport connection and performing the MCP handshake.
+    /// If called manually, it will cancel any ongoing automatic reconnection attempts.
+    /// - Parameter isRetryAttempt: Internal flag to indicate if this call is part of an automatic retry. Defaults to `false`.
+    /// - Throws: `MCPClientError` if the client is already connected/connecting or if the connection/handshake fails.
+    public func connect(isRetryAttempt: Bool = false) async throws {
+        if !isRetryAttempt {
+            print("MCPClient: Manual connect() called. Cancelling any ongoing reconnection attempts.")
+            await self.cancelReconnectionAttempt()
         }
 
-        self.connectionState = .connecting
-        print("MCPClient: State changed to connecting.")
+        // 1. Check Current State and Transition to .connecting
+        // Allow connect if disconnected or if it's a retry originating from a reconnecting state.
+        switch connectionState {
+            case .connected, .connecting, .disconnecting:
+                // If it's a retry, this state means something went wrong with the retry loop's state management
+                // or an external state change occurred. For a manual call, it's a clear error.
+                print("MCPClient: connect(isRetryAttempt: \(isRetryAttempt)) called but client is in state \(connectionState).")
+                throw MCPClientError.alreadyConnected // Or a more specific error like .invalidStateForOperation
+            case .disconnected, .reconnecting: // .reconnecting is a valid prior state for a retry attempt
+                print("MCPClient: connect(isRetryAttempt: \(isRetryAttempt)) - Current state \(connectionState). Transitioning to .connecting.")
+                self.connectionState = .connecting
+        }
 
-        // Start observing transport state changes.
-        // This task should be managed (e.g., cancelled on disconnect).
-        transportStateObservationTask?.cancel() // Cancel any previous observation task
+        // Reset handshake in progress flag
+        self.handshakeInProgress = false // Reset handshake flag
+
+        // 2. Transition to Connecting
+        // self.connectionState = .connecting
+        // self.handshakeInProgress = false // Reset handshake flag
+
+        // Cancel any previous observation task before starting a new one
+        transportStateObservationTask?.cancel()
         transportStateObservationTask = Task {
-            // Now using the stateStream from the MCPTransport protocol.
             print("MCPClient: Starting transport state observation task.")
-            for await transportState in self.transport.stateStream { 
-               print("MCPClient: Received transport state: \(transportState)")
-               switch transportState {
-               case .connecting:
-                   // MCPClient itself initiates connecting state, transport confirms.
-                   // Only update if not already connecting or connected from client's perspective.
-                   if self.connectionState != .connecting && self.connectionState != .connected {
-                       self.connectionState = .connecting
-                       print("MCPClient: State changed to connecting (from transport stateStream).")
-                   }
-               case .connected:
-                   if self.connectionState != .connected {
-                       self.connectionState = .connected
-                       print("MCPClient: State changed to connected (from transport stateStream).")
-                   }
-               case .disconnected(let error):
-                   print("MCPClient: Transport reported disconnected via stateStream, error: \(String(describing: error)). Initiating client disconnect.")
-                   if let err = error {
-                       // Avoid re-disconnecting if already in the process for the same transport error
-                       if case .disconnected(reason: .transportError(let existingError)) = self.connectionState, (err as NSError).isEqual(existingError as NSError) {
-                           // Already disconnected for this specific transport error
-                       } else if case .disconnected(reason: .connectionFailed(let existingError)) = self.connectionState, (err as NSError).isEqual(existingError as NSError) {
-                           // Already disconnected for this specific connection failure error
-                       } else {
-                           await self.disconnect(reason: .transportError(err))
-                       }
-                   } else {
-                       // Avoid re-disconnecting if already disconnected normally
-                       if self.connectionState != .disconnected(reason: .normal) {
-                           await self.disconnect(reason: .normal)
-                       }
-                   }
-                   return // Exit task as client is disconnecting or already disconnected by transport's report.
-               }
+            for await transportState in self.transport.stateStream {
+                print("MCPClient: Received transport state: \(transportState)")
+                await handleTransportStateChange(transportState)
             }
             print("MCPClient: Transport state observation task finished (stream closed).")
-            // If the stream closes, ensure client is in a disconnected state if not already handled by a .disconnected event.
-            if self.connectionState != .disconnected(reason: .normal) && !self.isDisconnectedWithErrorInternal() {
-               await self.disconnect(reason: .normal) 
+            // If the stream closes and we are not already disconnected, transition to disconnected.
+            if self.connectionState != .disconnected(error: nil) && !isDisconnectedWithError() {
+                print("MCPClient: Transport stream closed, ensuring client is disconnected.")
+                self.connectionState = .disconnected(error: MCPClientError.transportError(NSError(domain: "MCPClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "Transport stream closed unexpectedly"])))
+                await self.cleanupConnectionTasksAndState(isGraceful: false, error: self.connectionState)
             }
         }
 
         // Start listening to incoming messages from the transport.
-        // This is the messageProcessingTask.
-        startListeningToTransportInternal() // Renamed to avoid confusion with a potentially public API
+        startListeningToTransportInternal()
 
         do {
+            // 3. Connect Transport
+            print("MCPClient: Attempting transport.connect()...")
             try await transport.connect()
-            // If connect succeeds, we assume the transport is connected.
-            // The stateStream (when implemented) would confirm this.
-            // For now, directly set to connected if no error.
-            self.connectionState = .connected
-            print("MCPClient: transport.connect() succeeded. State changed to connected.")
-            
-            // If a handshake is required by MCPClient *after* the transport layer connects, trigger it here.
-            // e.g., try await self.performHandshake()
+            // transport.connect() returning doesn't guarantee transport.stateStream has emitted .connected.
+            // We rely on the transportStateObservationTask to see the .connected from the stream
+            // and then trigger the handshake from handleTransportStateChange.
+            // However, if transport.connect() succeeds, we can assume it *intends* to be connected.
+            // The actual handshake will only proceed once stateStream confirms .connected.
+            print("MCPClient: transport.connect() succeeded. Waiting for transport stateStream to confirm .connected for handshake.")
 
         } catch {
             print("MCPClient: transport.connect() failed. Error: \(error)")
-            let disconnectReason = DisconnectReason.connectionFailed(error)
-            await self.disconnect(reason: disconnectReason)
-            throw error
+            self.connectionState = .disconnected(error: error)
+            await cleanupConnectionTasksAndState(isGraceful: false, error: error)
+            throw error // Rethrow the original transport connection error
+        }
+    }
+
+    private func handleTransportStateChange(_ transportState: TransportConnectionState) async {
+        switch transportState {
+        case .connecting:
+            // MCPClient initiates its own .connecting state.
+            // This is the transport confirming it's also in a connecting phase.
+            if self.connectionState != .connecting && self.connectionState != .connected {
+                 self.connectionState = .connecting
+            }
+        case .connected:
+            // Transport is connected. If client is in 'connecting' state, proceed with handshake.
+            if self.connectionState == .connecting && !self.handshakeInProgress {
+                print("MCPClient: Transport connected. Proceeding with MCP handshake.")
+                self.handshakeInProgress = true
+                Task {
+                    do {
+                        // 4. Perform MCP Handshake
+                        print("MCPClient: Performing initialize handshake...")
+                        let initializeResult = try await self.initialize(clientCapabilities: self.clientCapabilities)
+                        self.serverCapabilities = initializeResult.capabilities
+                        self.handshakeInProgress = false
+                        // 5. Transition to Connected (MCP Level)
+                        self.connectionState = .connected
+                        print("MCPClient: Handshake successful. MCPClient is now connected.")
+                        await self.startHeartbeatIfNeeded()
+                    } catch {
+                        print("MCPClient: MCP Handshake (initialize) failed. Error: \(error)")
+                        self.handshakeInProgress = false
+                        let handshakeError = MCPClientError.handshakeFailed(underlyingError: error)
+                        // Store the error before calling disconnect, as disconnect might clear it if not passed.
+                        self.connectionState = .disconnecting // Intermediate state
+                        await self.disconnect(triggeredByError: handshakeError) // Disconnect transport and cleanup
+                        // disconnect() will set final .disconnected state with the error.
+                    }
+                }
+            } else if self.connectionState == .connected {
+                // Already connected, transport might be reconfirming or recovering.
+                print("MCPClient: Transport reported connected, client already in .connected state.")
+            } else {
+                print("MCPClient: Transport reported connected, but client in unexpected state: \(self.connectionState). Ignoring.")
+            }
+
+        case .disconnected(let transportError):
+            print("MCPClient: Transport reported disconnected via stateStream, error: \(String(describing: transportError)).")
+            let effectiveError = transportError ?? MCPClientError.transportError(NSError(domain: "MCPClient", code: -2, userInfo: [NSLocalizedDescriptionKey: "Transport disconnected without specific error."])) 
+
+            if self.connectionState == .disconnecting {
+                print("MCPClient: Transport disconnected, client already in .disconnecting state. Allowing disconnect() to finalize.")
+                // disconnect() will handle setting the final .disconnected state.
+                return
+            }
+            
+            if self.connectionState == .connected || self.connectionState == .connecting {
+                print("MCPClient: Client was \(self.connectionState), now disconnected by transport.")
+                await self.stopHeartbeat() // Stop heartbeat as connection is lost
+                self.connectionState = .disconnected(error: effectiveError)
+                if self.handshakeInProgress {
+                    print("MCPClient: Handshake was in progress, now cancelled due to transport disconnection.")
+                    self.handshakeInProgress = false // Cancel handshake
+                }
+                // Perform cleanup similar to disconnect, but initiated by transport failure.
+                await self.cleanupConnectionTasksAndState(isGraceful: false, error: effectiveError)
+            } else if case .disconnected = self.connectionState {
+                print("MCPClient: Transport disconnected, client already in .disconnected state.")
+            } else {
+                print("MCPClient: Transport disconnected, client in unexpected state: \(self.connectionState). Setting to disconnected.")
+                self.connectionState = .disconnected(error: effectiveError)
+                await self.cleanupConnectionTasksAndState(isGraceful: false, error: effectiveError)
+            }
         }
     }
 
     /// Disconnects from the server and cleans up resources.
-    public func disconnect(reason: DisconnectReason = .normal) async {
-        guard connectionState == .connected || connectionState == .connecting || connectionState == .disconnecting else {
-            // If already disconnected with the same reason, or trying to disconnect normally from an error state, allow.
-            if case .disconnected(let currentReason) = connectionState, currentReason == reason { return } // Already disconnected with this reason
-            // Allow disconnecting normally even if previously disconnected with error
-            if reason == .normal, case .disconnected = connectionState { /* allow */ } 
-            else if connectionState != .connecting { // if not connecting, and not one of the above, then it's an invalid state to disconnect from
-                 print("MCPClient: Not in a valid state to disconnect (current: \(connectionState), requested reason: \(reason)).")
-                 return
+    /// - Parameter triggeredByError: Optional error that triggered this disconnection. If nil, it's a normal disconnect.
+    public func disconnect(triggeredByError: Error? = nil) async {
+        print("MCPClient: disconnect(triggeredByError: \(String(describing: triggeredByError))) called. Current state: \(connectionState)")
+        // 1. Check Current State
+        // Allow calling disconnect even if already disconnecting to ensure cleanup, or if an error occurs during connecting.
+        if connectionState == .disconnected(error: nil) && triggeredByError == nil {
+            if !isDisconnectedWithError() { // Only return if truly cleanly disconnected and no new error
+                print("MCPClient: Already disconnected cleanly. Nothing to do.")
+                return
             }
         }
+        // If already disconnecting for the same reason, don't recurse or overlap.
+        if connectionState == .disconnecting && triggeredByError == nil { // TODO: better check for same error
+             print("MCPClient: Already disconnecting. Ignoring redundant call.")
+             // return // Be careful here, might need to allow completion
+        }
 
-        // If already disconnecting, and this call is for a different reason (e.g. error during disconnecting)
-        // we might want to update the reason. For now, let's assume disconnect is idempotent if already disconnecting.
-        if connectionState == .disconnecting && reason != .normal {
-             print("MCPClient: Already disconnecting. New disconnect reason \(reason) requested.")
-             // Potentially update a pending disconnect reason if that's a desired feature.
-        } else {
-            self.connectionState = .disconnecting
-        }
+        // 2. Set State to Disconnecting
+        // Preserve existing error if disconnect is called while already disconnected with error
+        let previousError: Error? = isDisconnectedWithError() ? connectionStateError() : nil
+        self.connectionState = .disconnecting
+
+        // Perform cleanup actions
+        await cleanupConnectionTasksAndState(isGraceful: triggeredByError == nil, error: triggeredByError ?? previousError)
         
-        stopListeningToTransportInternal() // Renamed to ensure it calls the task canceller
-        await transport.disconnect() // MCPTransport.disconnect is async
-        // If MCPTransport.disconnect becomes async, this should be `await transport.disconnect()`
-        
-        self.pendingRequests.forEach { _, value in
-            value.continuation.resume(throwing: MCPClientError.transportError(CocoaError(.userCancelled))) // Or a more specific error based on disconnect reason
-        }
-        self.pendingRequests.removeAll()
-        self.connectionState = .disconnected(reason: reason)
-        print("MCPClient: Disconnected. Reason: \(reason)")
+        print("MCPClient: disconnect() finished. Final state: \(connectionState)")
     }
 
-    // Helper to check if currently disconnected due to an error
+    /// Helper to check if current state is .disconnected with any error.
     private func isDisconnectedWithError() -> Bool {
-        if case .disconnected(let reason) = connectionState, reason != .normal && reason != nil {
+        if case .disconnected(let error) = connectionState, error != nil {
             return true
         }
         return false
     }
 
-    // Helper to check if currently disconnected due to an error (internal version)
-    private func isDisconnectedWithErrorInternal() -> Bool {
-        if case .disconnected(let reason) = connectionState, reason != .normal && reason != nil {
-            return true
+    /// Helper to get error from .disconnected state.
+    private func connectionStateError() -> Error? {
+        if case .disconnected(let error) = connectionState {
+            return error
         }
-        return false
+        return nil
+    }
+
+    /// Centralized cleanup of tasks and state.
+    private func cleanupConnectionTasksAndState(isGraceful: Bool, error: Error?) async {
+        print("MCPClient: cleanupConnectionTasksAndState(isGraceful: \(isGraceful), error: \(String(describing: error)))")
+
+        await stopHeartbeat()
+        await cancelReconnectionAttempt() // Ensure any reconnection attempt is also cancelled
+
+        // 3. Disconnect Transport (if not already disconnected by transport itself)
+        // Check transport's own state if possible, or rely on MCPClient's view
+        // For now, call transport.disconnect() idempotently or if we think it's needed.
+        // If an error triggered this, transport might already be down.
+        if connectionState != .disconnected(error: nil) || isDisconnectedWithError() { // Avoid disconnecting transport if we are already cleanly disconnected by client's choice
+            // Only call transport.disconnect if we are not already being told by transport it's down
+            // This check is tricky. For now, let transport.disconnect() be idempotent.
+            print("MCPClient: Calling transport.disconnect() during cleanup.")
+            await self.transport.disconnect() // Transport's disconnect should be idempotent
+        }
+
+        // 4. Cancel Tasks
+        print("MCPClient: Cancelling tasks (transportStateObservationTask, messageProcessingTask).")
+        transportStateObservationTask?.cancel()
+        transportStateObservationTask = nil
+        messageProcessingTask?.cancel()
+        messageProcessingTask = nil // Assuming messageProcessingTask is also a property
+
+        // 5. Clear Sensitive/Session-Specific State
+        print("MCPClient: Clearing serverCapabilities and pending requests.")
+        self.serverCapabilities = nil
+        self.handshakeInProgress = false
+
+        // 6. Clear Pending Requests (Fail them - Details in Step 4.5)
+        // For now, just clear them. Actual failing logic will be more complex.
+        let requestsToFail = pendingRequests
+        pendingRequests.removeAll()
+        for (_, pending) in requestsToFail {
+            pending.continuation.resume(throwing: MCPClientError.operationCancelled) // Or a more specific error
+        }
+
+        // 7. Set Final State to Disconnected
+        if let err = error {
+            // If an error was passed (e.g., from handshake failure or transport notification)
+            // or if disconnect was called with an error.
+            if !(self.connectionState == .disconnected(error: err)) { // Avoid redundant didSet if already set
+                 self.connectionState = .disconnected(error: err)
+            }
+        } else {
+            // Normal disconnect or cleanup after non-error based disconnection
+            if !(self.connectionState == .disconnected(error: nil)) { // Avoid redundant didSet
+                 self.connectionState = .disconnected(error: nil)
+            }
+        }
+        print("MCPClient: Cleanup complete. Final state: \(connectionState)")
     }
 
     // MARK: - API Layer (Public Methods)
@@ -252,61 +440,12 @@ public actor MCPClient {
     /// The client sends its capabilities (provided at MCPClient initialization),
     /// and the server responds with its own.
     /// - Returns: The capabilities of the server.
-    public func initialize() async throws -> ServerCapabilities {
-        let params = InitializeRequestParams(capabilities: self.clientCapabilities)
+    public func initialize(clientCapabilities: ClientCapabilities) async throws -> InitializeResult {
+        let params = InitializeRequestParams(capabilities: clientCapabilities)
         // The `sendRequest` method handles JSON-RPC wrapping, ID generation, sending, and response matching.
         // It's expected to return the decoded result of the type specified (ServerCapabilities in this case).
-        let serverCaps: ServerCapabilities = try await self.sendRequest(method: "session/initialize", params: params)
-        self.serverCapabilities = serverCaps // Store server capabilities upon successful initialization
+        let serverCaps: InitializeResult = try await self.sendRequest(method: "session/initialize", params: params)
         return serverCaps
-    }
-
-    /// Lists available resources on the server.
-    /// Resources are typically documents or data items the server can provide.
-    /// - Returns: An array of `Resource` objects, representing available resources.
-    public func listResources() async throws -> [Resource] {
-        let method = "resources/list"
-        // This operation takes no parameters, so we use `EmptyParams`.
-        let result: ListResourcesResult = try await self.sendRequest(method: method, params: EmptyParams())
-        return result.resources
-    }
-
-    /// Retrieves a specific prompt by its ID.
-    /// Prompts are typically used to guide language model interactions.
-    /// - Parameter id: The ID of the prompt to retrieve.
-    /// - Returns: The `Prompt` object.
-    public func getPrompt(id: String) async throws -> Prompt {
-        let method = "prompts/get"
-        let params = GetPromptParams(id: id)
-        let result: GetPromptResult = try await self.sendRequest(method: method, params: params)
-        return result.prompt
-    }
-
-    /// Reads the content of a specific resource, optionally at a specific version.
-    /// - Parameters:
-    ///   - id: The ID of the resource to read.
-    ///   - version: Optional version string for the resource.
-    /// - Returns: The content of the resource.
-    public func readResource(id: String, version: String?) async throws -> ResourceContent {
-        let method = "resources/read"
-        let params = ReadResourceParams(id: id, version: version)
-        // Assuming ResourceContent is the direct result type from the schema for this call.
-        let content: ResourceContent = try await self.sendRequest(method: method, params: params)
-        return content
-    }
-
-    /// Calls a tool on the server with the given name and arguments.
-    /// Tools are server-defined functions that the client can invoke.
-    /// - Parameters:
-    ///   - name: The name of the tool to call.
-    ///   - arguments: Optional arguments for the tool, structured as a dictionary.
-    /// - Returns: The result of the tool call, as defined by `CallToolResult`.
-    public func callTool(name: String, arguments: [String: AnyCodable]? = nil) async throws -> CallToolResult {
-        let method = "tool/call"
-        let params = CallToolParams(name: name, arguments: arguments)
-        // Assuming CallToolResult is the direct result type from the schema for this call.
-        let result: CallToolResult = try await self.sendRequest(method: method, params: params)
-        return result
     }
 
     // MARK: - Request Handling
@@ -332,13 +471,24 @@ public actor MCPClient {
         // e.g., if RequestId is struct RequestId { let value: String }, then RequestId(value: requestIDString)
         let mcpRequestID = RequestId(value: requestIDString) // Adjust if RequestId init is different
 
-        // Construct the JSON-RPC request object using schema types.
-        // JSONRPCRequest.params expects AnyCodable?, so wrap params if present.
-        let jsonRpcRequest = JSONRPCRequest(id: mcpRequestID, method: method, params: params.map { AnyCodable($0) })
+        // Encode params to AnyCodable for Schema.JSONRPCRequest
+        let anyCodableParams: AnyCodable?
+        if Params.self == NoParams.self {
+            anyCodableParams = nil
+        } else {
+            do {
+                anyCodableParams = try AnyCodable(params)
+            } catch {
+                print("MCPClient Error: Failed to encode params to AnyCodable for method \(method): \(error)")
+                throw MCPClientError.requestEncodingFailed(error)
+            }
+        }
+
+        let request = Schema.JSONRPCRequest(id: mcpRequestID, method: method, params: anyCodableParams)
 
         let encodedRequestData: Data
         do {
-            encodedRequestData = try self.jsonEncoder.encode(jsonRpcRequest)
+            encodedRequestData = try self.jsonEncoder.encode(request)
             // For debugging:
             // print("MCPClient [Request ID: \(requestIDString)] Sending: \(String(data: encodedRequestData, encoding: .utf8) ?? "Non-UTF8 data")")
         } catch {
@@ -434,7 +584,7 @@ public actor MCPClient {
             if let errorObject = baseMessage.error {
                 // Server returned an error
                 print("MCPClient: Received error response for ID \(id.stringValue): \(errorObject.code) - \(errorObject.message)")
-                let mcpError = MCPClientError.serverError(code: errorObject.code, message: errorObject.message, data: errorObject.data)
+                let mcpError = MCPClientError.jsonRpcError(errorObject)
                 (pending.continuation as! CheckedContinuation<AnyDecodable, MCPClientError>).resume(throwing: mcpError) // Cast to specific error type if not Any
             } else if let resultObject = baseMessage.result {
                 // Server returned a successful result
@@ -474,7 +624,7 @@ public actor MCPClient {
             // This is a Server-Initiated Request to the Client
             // print("MCPClient: Received server-initiated request (ID: \(requestID.stringValue), Method: \(methodName))")
             do {
-                let serverRequest = try self.jsonDecoder.decode(JSONRPCRequest<AnyCodable>.self, from: data)
+                let serverRequest = try self.jsonDecoder.decode(Schema.JSONRPCRequest.self, from: data)
                 await self.dispatchServerRequest(serverRequest)
             } catch {
                 print("MCPClient Error: Failed to decode server-initiated request (ID: \(requestID.stringValue), Method: \(methodName)). Error: \(error). Data: \(String(data: data, encoding: .utf8) ?? "Non-UTF8 data")")
@@ -514,22 +664,47 @@ public actor MCPClient {
         }
     }
 
-    private func dispatchServerRequest(_ request: JSONRPCRequest<AnyCodable>) async {
+    private func dispatchServerRequest(_ request: Schema.JSONRPCRequest) async {
         // print("MCPClient: Dispatching server request: \(request.method), ID: \(request.id.stringValue)")
         switch request.method {
-        case "sampling/createMessage": // Example for MCP Sampling
+        case MCPMethods.Sampling.createMessage: // Ensure MCPMethods.Sampling.createMessage is defined
             do {
-                let params = try decodeParams(request.params, as: CreateMessageRequest.Params.self)
-                await self.handleSamplingCreateMessageRequest(id: request.id, params: params)
+                // Assuming params for sampling/createMessage are of type SamplingCreateMessageParams
+                await self.handleSamplingCreateMessageRequest(id: request.id, params: request.params) // Pass AnyCodable params
             } catch {
-                print("MCPClient Error: Failed to decode params for 'sampling/createMessage' request. ID: \(request.id.stringValue). Error: \(error)")
-                let errorResponse = JSONRPCResponse(id: request.id, error: JSONRPCErrorObject.invalidParams(message: "Failed to decode params: \(error.localizedDescription)"))
+                print("MCPClient Error: Failed to decode params for '\(request.method)' request. ID: \(request.id.stringValue). Error: \(error)")
+                let errorDetail = Schema.JSONRPCError.ErrorObject(code: -32602, message: "Invalid params for \(request.method): \(error.localizedDescription)")
+                let errorResponse = Schema.JSONRPCError(id: request.id, error: errorDetail)
                 await self.sendRawResponse(errorResponse)
             }
         // Add more cases for other server-initiated requests
         default:
             print("MCPClient Warning: Received server-initiated request for unknown method: \(request.method). ID: \(request.id.stringValue)")
-            let errorResponse = JSONRPCResponse(id: request.id, error: JSONRPCErrorObject.methodNotFound(methodName: request.method))
+            let errorDetail = Schema.JSONRPCError.ErrorObject(code: -32601, message: "Method not found: \(request.method)")
+            let errorResponse = Schema.JSONRPCError(id: request.id, error: errorDetail)
+            await self.sendRawResponse(errorResponse)
+        }
+    }
+
+    /// Specific handler for 'sampling/createMessage' server-initiated request.
+    private func handleSamplingCreateMessageRequest(id: RequestId, params: AnyCodable) async {
+        guard let appHandler = self.onSamplingCreateMessage else {
+            print("MCPClient: '\(MCPMethods.Sampling.createMessage)' request received, but no onSamplingCreateMessage handler is set.")
+            let errorDetail = Schema.JSONRPCError.ErrorObject(code: -32601, message: "Method not found (handler not configured on client): \(MCPMethods.Sampling.createMessage)")
+            let errorResponse = Schema.JSONRPCError(id: id, error: errorDetail)
+            await self.sendRawResponse(errorResponse)
+            return
+        }
+
+        do {
+            // Assuming the handler returns a result that can be encoded into AnyCodable for the response.
+            let result: AnyCodable = try await appHandler(params) // Adjust based on actual handler signature
+            let response = Schema.JSONRPCResponse(id: id, result: result) // For successful response
+            await self.sendRawResponse(response)
+        } catch {
+            print("MCPClient: Application handler for '\(MCPMethods.Sampling.createMessage)' (ID: \(id.stringValue)) threw an error: \(error.localizedDescription)")
+            let errorDetail = Schema.JSONRPCError.ErrorObject(code: -32603, message: "Internal error in application handler for '\(MCPMethods.Sampling.createMessage)': \(error.localizedDescription)")
+            let errorResponse = Schema.JSONRPCError(id: id, error: errorDetail)
             await self.sendRawResponse(errorResponse)
         }
     }
@@ -577,29 +752,255 @@ public actor MCPClient {
         }
     }
 
-    // MARK: - Placeholder Server-Initiated Request Handlers
+    // MARK: - Heartbeat Management
 
-    private func handleSamplingCreateMessageRequest(id: RequestId, params: CreateMessageRequest.Params) async {
-        // print("MCPClient [Server Request]: Received 'sampling/createMessage' with ID \(id.stringValue) and params: \(params)")
-        
-        guard let appHandler = self.onSamplingCreateMessage else {
-            print("MCPClient: 'sampling/createMessage' request received, but no onSamplingCreateMessage handler is set.")
-            let error = JSONRPCErrorObject.methodNotFound(methodName: "sampling/createMessage (handler not configured on client)")
-            let response = JSONRPCResponse<AnyCodable, JSONRPCErrorObject>(id: id, error: error)
-            await self.sendRawResponse(response)
+    private func isPersistentTransport() -> Bool {
+        #if os(macOS)
+        if transport is StdioTransport { return true }
+        #endif
+        if transport is SSETransport { return true }
+        // Add StreamableHTTPTransport if it can be used in a persistent streaming mode
+        // if transport is StreamableHTTPTransport { return true } 
+        return false
+    }
+
+    private func startHeartbeatIfNeeded() async {
+        guard let interval = self.heartbeatInterval, interval > 0, isPersistentTransport(), self.connectionState == .connected else {
+            // print("MCPClient: Heartbeat not started. Interval: \(String(describing: heartbeatInterval)), Persistent: \(isPersistentTransport()), State: \(connectionState)")
             return
         }
 
-        do {
-            let result = try await appHandler(params)
-            let response = JSONRPCResponse(id: id, result: result)
-            await self.sendRawResponse(response)
-        } catch {
-            print("MCPClient: Application handler for 'sampling/createMessage' (ID: \(id.stringValue)) threw an error: \(error.localizedDescription)")
-            // You might want to define a more specific error code for application errors.
-            let jsonRpcError = JSONRPCErrorObject.internalError(message: "Application handler for 'sampling/createMessage' failed: \(error.localizedDescription)")
-            let response = JSONRPCResponse<AnyCodable, JSONRPCErrorObject>(id: id, error: jsonRpcError)
-            await self.sendRawResponse(response)
+        // Cancel any existing heartbeat task before starting a new one
+        await stopHeartbeat() // Ensure previous is stopped
+
+        print("MCPClient: Starting heartbeat with interval \(interval)s.")
+        heartbeatTask = Task { [weak self] in
+            guard let self = self else { return }
+            while !Task.isCancelled {
+                // Check connection state before sleeping and before pinging
+                // This ensures that if disconnect happens while sleeping, we don't ping.
+                guard await self.connectionState == .connected else {
+                    print("MCPClient: Heartbeat: No longer connected, stopping.")
+                    break
+                }
+
+                do {
+                    try await Task.sleep(for: .seconds(interval))
+                    
+                    // Re-check cancellation and connection state after sleep
+                    if Task.isCancelled { break }
+                    guard await self.connectionState == .connected else {
+                        print("MCPClient: Heartbeat: No longer connected after sleep, stopping.")
+                        break
+                    }
+                    
+                    print("MCPClient: Heartbeat: Sending ping...")
+                    try await self.performPing()
+                } catch is CancellationError {
+                    print("MCPClient: Heartbeat task cancelled.")
+                    break
+                } catch {
+                    print("MCPClient: Heartbeat: Ping failed: \(error). Connection considered broken.")
+                    // Use a non-blocking Task to call handleConnectionFailure to avoid deadlocking the actor
+                    // if handleConnectionFailure itself tries to re-acquire actor context in a blocking way.
+                    // However, handleConnectionFailure is an async func on the actor, so direct await is fine.
+                    await self.handleConnectionFailure(error: MCPClientError.pingFailed(underlyingError: error))
+                    break // Exit heartbeat loop
+                }
+            }
+            print("MCPClient: Heartbeat task finished.")
+            // Ensure task reference is cleared if it finishes naturally (e.g. due to state change)
+            // However, stopHeartbeat() should be the primary way it's cleared.
+            // If we are cancelling, the state might need to be adjusted if it was .reconnecting.
+            // However, usually, a manual connect/disconnect will set the state appropriately afterwards.
+            // If current state is .reconnecting, and we cancel, what should be the state?
+            // It should transition to .disconnected(error: nil) if cancelled by a manual disconnect
+            // or .connecting if cancelled by a manual connect.
+            // This method is primarily for stopping the *task*. State is managed by callers.
         }
+    }
+
+    private func stopHeartbeat() async { // Made async to align if needed, though current ops are sync
+        if heartbeatTask != nil {
+            print("MCPClient: Stopping heartbeat task.")
+            heartbeatTask?.cancel()
+            heartbeatTask = nil
+        }
+    }
+
+    private func performPing() async throws {
+        // Assuming sendRequest has its own timeout mechanism or handles transport errors effectively.
+        // If sendRequest can hang indefinitely on a broken connection without a timeout,
+        // this performPing might need to be wrapped with a timeout, e.g.:
+        // try await withTimeout(seconds: 5) { // Hypothetical timeout utility
+        //    _ = try await self.sendRequest(method: "mcp/ping", params: NoParams(), responseType: NoResult.self)
+        // }
+        print("MCPClient: performPing() called")
+        _ = try await self.sendRequest(method: "mcp/ping", params: NoParams(), responseType: NoResult.self)
+        print("MCPClient: Ping successful.")
+    }
+
+    // MARK: - Connection Failure Handling
+
+    private func handleConnectionFailure(error: Error) async {
+        // Ensure this is only processed if we are in a state that expects a connection.
+        guard connectionState == .connected || connectionState == .connecting else {
+            print("MCPClient: handleConnectionFailure called in state \(connectionState) with error \(error). Ignoring as not connected/connecting.")
+            return
+        }
+        
+        print("MCPClient: Handling connection failure: \(error)")
+        await self.stopHeartbeat() // Stop heartbeat first
+        
+        // Set the state to disconnected with the error.
+        // This state change should be observed by any reconnection logic (Step 4.3).
+        self.connectionState = .disconnected(error: error)
+        
+        // Important: The transportStateObservationTask might also detect the disconnection if it's a transport-level issue.
+        // This handleConnectionFailure is more for logical failures like ping timeout or server error on ping.
+        // We need to ensure that we also clean up other tasks as if the transport itself reported disconnection.
+        // Calling cleanupConnectionTasksAndState ensures transport.disconnect, task cancellations, etc.
+        // However, be careful not to cause re-entrant calls if cleanupConnectionTasksAndState itself calls handleConnectionFailure.
+        // The guard at the start of this func should prevent simple re-entrancy on state.
+        
+        // For a ping failure, the transport might still think it's connected.
+        // We are declaring the *MCP session* as dead.
+        // We should still try to tell the transport to disconnect to clean up its resources.
+        print("MCPClient: Connection failure handled. Requesting transport cleanup.")
+        // No, don't call full cleanup here as it might be too aggressive if reconnection is desired.
+        // The primary role of handleConnectionFailure is to set state to .disconnected(error: error)
+        // and stop heartbeats. Reconnection logic (4.3) or explicit disconnect() will do full cleanup.
+        // For now, we ensure the transport.disconnect() is called by the main disconnect() path
+        // or when the transportStateObservationTask sees the transport truly die.
+        // If a ping fails, we mark MCPClient as disconnected. If user calls disconnect(), it will clean up.
+        // If reconnection logic kicks in, it will call connect(), which starts fresh.
+    }
+
+    // MARK: - Reconnection Management
+
+    private func connectionStateDidChange(from oldState: ConnectionState, to newState: ConnectionState) async {
+        if case .disconnected(let error) = newState, error != nil {
+            print("MCPClient: connectionStateDidChange - Detected disconnection with error: \(error!).")
+            await initiateReconnectionIfNeeded(withError: error!)
+        } else if newState == .connected {
+            print("MCPClient: connectionStateDidChange - Successfully connected. Resetting reconnection attempts.")
+            await cancelReconnectionAttempt() // Clears task and potentially resets state from .reconnecting
+            self.currentReconnectAttempt = 0 // Explicitly reset attempt count
+        }
+
+        // Stop heartbeat if we are no longer in a connected state and heartbeat was running.
+        // This check is important because handleConnectionFailure also calls stopHeartbeat.
+        // We want to ensure it's stopped if state moves from .connected for any other reason too.
+        if oldState == .connected && newState != .connected {
+            if heartbeatTask != nil { // Check if heartbeat was running
+                 print("MCPClient: connectionStateDidChange - No longer connected (was \(oldState), now \(newState)), ensuring heartbeat is stopped.")
+                await stopHeartbeat()
+            }
+        }
+    }
+
+    private func initiateReconnectionIfNeeded(withError error: Error) async {
+        guard enableAutoReconnect else {
+            print("MCPClient: Auto-reconnect is disabled. Will not attempt to reconnect.")
+            return
+        }
+        // Ensure we are actually in a disconnected state with an error.
+        // The call from connectionStateDidChange already checks this, but good for direct calls if any.
+        guard case .disconnected(let currentError) = self.connectionState, currentError != nil else {
+            print("MCPClient: initiateReconnectionIfNeeded called but state is not .disconnected with error, or auto-reconnect disabled. Current state: \(self.connectionState)")
+            return
+        }
+
+        // Don't attempt reconnection if a reconnection task is already running or starting
+        guard reconnectionTask == nil else {
+            print("MCPClient: Reconnection attempt already in progress or scheduled.")
+            return
+        }
+        
+        print("MCPClient: Initiating reconnection process due to error: \(error)")
+        self.currentReconnectAttempt = 0 // Reset before starting a new loop
+        self.reconnectionTask = Task { [weak self] in
+            await self?.runReconnectionLoop()
+            // Ensure task reference is cleared when loop finishes or is cancelled externally
+            // This is important so that a new reconnection can be initiated if needed later.
+            await self?.clearReconnectionTask()
+        }
+    }
+
+    private func runReconnectionLoop() async {
+        while !Task.isCancelled {
+            self.currentReconnectAttempt += 1
+            if maxReconnectAttempts > 0 && self.currentReconnectAttempt > maxReconnectAttempts {
+                print("MCPClient: Max reconnection attempts (\(maxReconnectAttempts)) reached.")
+                self.connectionState = .disconnected(error: MCPClientError.maxReconnectAttemptsReached) // Final disconnected state
+                break // Exit loop
+            }
+
+            var delay = min(maxReconnectDelay, baseReconnectDelay * pow(2.0, Double(currentReconnectAttempt - 1)))
+            let jitterRange = delay * reconnectDelayJitterFactor
+            let jitter = Double.random(in: -jitterRange...jitterRange)
+            delay = max(0.1, delay + jitter) // Ensure delay is not negative or too small
+
+            self.connectionState = .reconnecting(attempt: currentReconnectAttempt, nextAttemptIn: delay)
+            print("MCPClient: Reconnecting attempt \(currentReconnectAttempt) of \(maxReconnectAttempts > 0 ? String(maxReconnectAttempts) : "infinity"), next attempt in \(String(format: "%.2f", delay))s.")
+            
+            do {
+                try await Task.sleep(for: .seconds(delay))
+                if Task.isCancelled { 
+                    print("MCPClient: Reconnection loop sleep cancelled.")
+                    break 
+                }
+
+                print("MCPClient: Attempting to connect (reconnect attempt \(currentReconnectAttempt))...")
+                try await self.connect(isRetryAttempt: true)
+                    
+                // If connect() succeeds, connectionState becomes .connected.
+                // The connectionState.didSet -> connectionStateDidChange logic will:
+                // 1. Call cancelReconnectionAttempt() (which cancels this task and nils reconnectionTask).
+                // 2. Reset currentReconnectAttempt = 0.
+                // So, this loop should effectively terminate if connect() is successful.
+                // We add an explicit check for .connected state to break, though cancellation is primary exit.
+                if await self.connectionState == .connected {
+                    print("MCPClient: Reconnection successful on attempt \(currentReconnectAttempt). Loop should terminate via cancellation.")
+                    // The task will be cancelled by cancelReconnectionAttempt called from connectionStateDidChange.
+                    // No need to break explicitly if cancellation is reliable.
+                    // However, if cancellation is not immediate, this break helps exit sooner.
+                    break
+                }
+                // If connect() failed, connectionState will be .disconnected(error), and loop continues.
+                // The error from connect() is handled by connect() itself setting the state.
+            } catch is CancellationError {
+                print("MCPClient: Reconnection task explicitly cancelled.")
+                break
+            } catch {
+                // This catch block handles errors from self.connect(isRetryAttempt: true)
+                // connect() itself should set the state to .disconnected(error: connectError)
+                print("MCPClient: Reconnect attempt \(currentReconnectAttempt) failed: \(error). State is \(await self.connectionState). Will retry if attempts remain.")
+                // Loop will continue if attempts remain and task not cancelled.
+            }
+        }
+        print("MCPClient: Exited reconnection loop. Attempt: \(currentReconnectAttempt)")
+    }
+
+    private func cancelReconnectionAttempt() async {
+        if let task = self.reconnectionTask {
+            print("MCPClient: Cancelling ongoing reconnection task.")
+            task.cancel()
+            // self.reconnectionTask = nil // Do not nil out here, let the task clean itself up via clearReconnectionTask()
+            // If we are cancelling, the state might need to be adjusted if it was .reconnecting.
+            // However, usually, a manual connect/disconnect will set the state appropriately afterwards.
+            // If current state is .reconnecting, and we cancel, what should be the state?
+            // It should transition to .disconnected(error: nil) if cancelled by a manual disconnect
+            // or .connecting if cancelled by a manual connect.
+            // This method is primarily for stopping the *task*. State is managed by callers.
+        }
+    }
+    
+    private func clearReconnectionTask() async {
+        print("MCPClient: Clearing reconnection task reference.")
+        self.reconnectionTask = nil
+        // If the loop finished because max attempts were reached, state is already .disconnected(MCPError.maxReconnectAttemptsReached)
+        // If it was cancelled by a successful connection, state is .connected.
+        // If cancelled by manual disconnect/connect, state is set by those methods.
     }
 }
