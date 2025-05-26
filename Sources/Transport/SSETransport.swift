@@ -38,16 +38,19 @@ public final actor SSETransport: MCPTransport {
     private var sseProcessingTask: Task<Void, Never>?
 
     public nonisolated let incomingMessages: AsyncStream<Data>
-    private var incomingMessagesContinuation: AsyncStream<Data>.Continuation?
+    private let incomingMessagesContinuation: AsyncStream<Data>.Continuation
 
     public nonisolated let stateStream: AsyncStream<TransportConnectionState>
-    private var stateStreamContinuation: AsyncStream<TransportConnectionState>.Continuation?
+    private let stateStreamContinuation: AsyncStream<TransportConnectionState>.Continuation
 
     private var currentRetryAttempt: Int = 0
     private let maxRetryAttempts: Int
     private let baseRetryDelay: TimeInterval
     private var lastEventID: String?
     private var customRetryDelay: TimeInterval?
+    
+    private var hasFinishedStateStream: Bool = false
+    private var hasFinishedIncomingMessagesStream: Bool = false
 
     public init(serverURL: URL, urlSession: URLSession = .shared, maxRetryAttempts: Int = 5, baseRetryDelay: TimeInterval = 1.0) {
         self.serverURL = serverURL
@@ -59,15 +62,15 @@ public final actor SSETransport: MCPTransport {
         self.incomingMessages = AsyncStream<Data> { continuation in
             incomingCont = continuation
         }
-        self.incomingMessagesContinuation = incomingCont
+        self.incomingMessagesContinuation = incomingCont!
 
         var stateCont: AsyncStream<TransportConnectionState>.Continuation!
         self.stateStream = AsyncStream<TransportConnectionState> { continuation in
             stateCont = continuation
         }
-        self.stateStreamContinuation = stateCont
+        self.stateStreamContinuation = stateCont!
         
-        self.stateStreamContinuation?.yield(.disconnected(error: nil))
+        self.stateStreamContinuation.yield(.disconnected(error: nil))
     }
 
     public func connect() async {
@@ -80,7 +83,7 @@ public final actor SSETransport: MCPTransport {
         currentRetryAttempt = 0
         customRetryDelay = nil
         
-        stateStreamContinuation?.yield(.connecting)
+        stateStreamContinuation.yield(.connecting)
         
         print("SSETransport: Starting new SSE processing task.")
         sseProcessingTask = Task {
@@ -107,20 +110,38 @@ public final actor SSETransport: MCPTransport {
 
     private func disconnectCleanup(with error: Error?) async {
         if sseProcessingTask == nil && error == nil {
-            if stateStreamContinuation == nil && incomingMessagesContinuation == nil {
+            // If no task was active and no error, only proceed if streams might still be open.
+            // This check helps prevent issues if disconnectCleanup is called redundantly.
+            if hasFinishedStateStream && hasFinishedIncomingMessagesStream {
+                print("SSETransport: disconnectCleanup called but streams already finished.")
                 return
             }
         }
         
         sseProcessingTask = nil
 
-        stateStreamContinuation?.yield(.disconnected(error: error))
+        if !hasFinishedStateStream {
+            stateStreamContinuation.yield(.disconnected(error: error))
+            stateStreamContinuation.finish()
+            hasFinishedStateStream = true
+            print("SSETransport: stateStream finished.")
+        } else if error != nil {
+            // If stream already finished but we have a new error, at least log it.
+            // This situation should ideally not happen if logic is correct.
+            print("SSETransport: stateStream already finished, but disconnectCleanup called with error: \(error?.localizedDescription ?? "Unknown error")")
+        }
         
-        incomingMessagesContinuation?.finish()
-        stateStreamContinuation?.finish()
-        incomingMessagesContinuation = nil
-        stateStreamContinuation = nil
-        print("SSETransport: Streams finished.")
+        if !hasFinishedIncomingMessagesStream {
+            incomingMessagesContinuation.finish()
+            hasFinishedIncomingMessagesStream = true
+            print("SSETransport: incomingMessagesStream finished.")
+        }
+
+        // Nil-ing out continuations is less critical now with the flags, but can be kept for completeness
+        // or removed if deemed unnecessary.
+        // incomingMessagesContinuation = nil 
+        // stateStreamContinuation = nil
+        print("SSETransport: disconnectCleanup completed.")
     }
 
     private func establishAndProcessSSEConnection() async {
@@ -159,7 +180,7 @@ public final actor SSETransport: MCPTransport {
                 throw SSETransportError.unexpectedHTTPStatus(statusCode: httpResponse.statusCode, responseBody: responseBody)
             }
             
-            stateStreamContinuation?.yield(.connected)
+            stateStreamContinuation.yield(.connected)
             currentRetryAttempt = 0
             customRetryDelay = nil
             print("SSETransport: Connected successfully.")
@@ -176,7 +197,7 @@ public final actor SSETransport: MCPTransport {
                     if !currentEventDataLines.isEmpty {
                         let fullDataString = currentEventDataLines.joined(separator: "\n")
                         if let jsonData = fullDataString.data(using: .utf8) {
-                            incomingMessagesContinuation?.yield(jsonData)
+                            incomingMessagesContinuation.yield(jsonData)
                         } else {
                             print("SSETransport: Failed to convert event data to UTF-8. Data: \(fullDataString)")
                         }
@@ -223,7 +244,7 @@ public final actor SSETransport: MCPTransport {
 
             print("SSETransport: Connection error: \(error.localizedDescription)")
             
-            stateStreamContinuation?.yield(.disconnected(error: error))
+            stateStreamContinuation.yield(.disconnected(error: error))
             let shouldRetry = currentRetryAttempt < maxRetryAttempts
             currentRetryAttempt += 1
             let baseDelayVal = customRetryDelay ?? (baseRetryDelay * pow(2.0, Double(currentRetryAttempt - 1)))

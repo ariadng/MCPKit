@@ -1,133 +1,125 @@
 # SSETransport
 
-## Overview
+`SSETransport` is a component of `MCPKit` that enables communication with an MCP (Model-Context Protocol) server using Server-Sent Events (SSE). SSE is a standard that allows a server to push data to a client asynchronously once an initial client connection has been established. This transport is suitable for scenarios where the server needs to send updates, notifications, or streamed data to the client.
 
-This file implements the `SSETransport` class, an actor conforming to the `MCPTransport` protocol. It provides a transport mechanism for `MCPClient` using Server-Sent Events (SSE). SSE is a standard for enabling servers to push data to web clients over a single, long-lived HTTP connection. This transport is primarily designed for server-to-client communication.
+## Key Features
 
-## `SSETransportError` Enum
+-   **Server-Sent Events (SSE) Protocol**: Implements client-side handling of an SSE connection.
+-   **HTTP-based**: Uses HTTP(S) GET requests to establish the event stream.
+-   **Automatic Reconnection**: Handles connection drops and attempts to reconnect automatically, respecting SSE `retry` fields and employing an exponential backoff strategy.
+-   **Last-Event-ID**: Supports sending the `Last-Event-ID` header on reconnection attempts to allow the server to resume the stream from the last known event.
+-   **Asynchronous Operations**: Built with Swift's `async/await` for non-blocking network I/O.
+-   **Stream-based Data Handling**:
+    -   `incomingMessages: AsyncStream<Data>`: Yields `Data` objects, where each typically represents the `data` field of an SSE event (potentially multi-line `data` fields are concatenated).
+    -   `stateStream: AsyncStream<TransportConnectionState>`: Provides real-time updates on the connection status (e.g., `.connecting`, `.connected`, `.disconnected`).
+-   **Error Handling**: Defines an `SSETransportError` enum for specific SSE-related issues.
+-   **Actor-based Thread Safety**: Implemented as a Swift `actor` for thread-safe state management.
 
-Defines errors specific to `SSETransport` operations.
+## Initialization
 
-### Definition
+To use `SSETransport`, initialize it with the server's SSE endpoint URL. You can also configure `URLSession`, maximum retry attempts, and the base retry delay.
+
 ```swift
-public enum SSETransportError: Error, LocalizedError {
-    case invalidURL
-    case sendingNotSupported
-    case unexpectedHTTPStatus(statusCode: Int, responseBody: String?)
-    case sseParsingError(description: String)
-    case streamEnded // Indicates the SSE stream ended, possibly normally.
-    case maxRetriesReached
-    case connectionAttemptFailed(Error)
-    // ... (localized descriptions)
-}
+let sseEndpointURL = URL(string: "https://example.com/mcp-events")!
+let transport = SSETransport(
+    serverURL: sseEndpointURL,
+    maxRetryAttempts: 5,       // Default: 5
+    baseRetryDelay: 1.0        // Default: 1.0 second
+)
 ```
 
-### Cases
--   `invalidURL`: The provided server URL is invalid.
--   `sendingNotSupported`: Sending data is not supported by `SSETransport`.
--   `unexpectedHTTPStatus(statusCode: Int, responseBody: String?)`: Received an unexpected HTTP status code from the server.
--   `sseParsingError(description: String)`: An error occurred while parsing an SSE event.
--   `streamEnded`: The Server-Sent Events stream ended.
--   `maxRetriesReached`: Maximum reconnection attempts have been reached.
--   `connectionAttemptFailed(Error)`: Failed to establish the SSE connection, encapsulating the underlying error.
+## Core `MCPTransport` Protocol Implementation
 
-## `SSETransport` Actor
+-   **`connect() async`**: 
+    -   If an existing SSE processing task is active, it's cancelled.
+    -   Resets retry attempts and custom retry delay.
+    -   Updates state to `.connecting`.
+    -   Starts a new `sseProcessingTask` (a `Task<Void, Never>`) which calls `establishAndProcessSSEConnection()`.
 
-An actor that implements the `MCPTransport` protocol for Server-Sent Events.
+-   **`send(_ data: Data) async throws`**: 
+    -   Throws `SSETransportError.sendingNotSupported`. SSE is primarily a server-to-client protocol; client-to-server messages are typically sent via separate HTTP requests, not over the SSE stream itself.
 
-### Definition
-```swift
-public final actor SSETransport: MCPTransport {
-    // Properties
-    private let serverURL: URL
-    private let urlSession: URLSession
-    private var sseProcessingTask: Task<Void, Never>?
-
-    public nonisolated let incomingMessages: AsyncStream<Data>
-    private var incomingMessagesContinuation: AsyncStream<Data>.Continuation?
-
-    public nonisolated let stateStream: AsyncStream<TransportConnectionState>
-    private var stateStreamContinuation: AsyncStream<TransportConnectionState>.Continuation?
-
-    private var currentRetryAttempt: Int
-    private let maxRetryAttempts: Int
-    private let baseRetryDelay: TimeInterval
-    private var lastEventID: String?
-    private var customRetryDelay: TimeInterval?
-
-    // Initializer, connect, send, disconnect, and private helper methods
-}
-```
-
-### Key Properties
--   `serverURL: URL`: The URL of the SSE server.
--   `urlSession: URLSession`: The URLSession instance used for HTTP requests.
--   `sseProcessingTask: Task<Void, Never>?`: The background task responsible for managing the SSE connection and processing incoming events.
--   `incomingMessages: AsyncStream<Data>`: (from `MCPTransport`) Stream for yielding received message data.
--   `stateStream: AsyncStream<TransportConnectionState>`: (from `MCPTransport`) Stream for yielding connection state changes.
--   `currentRetryAttempt: Int`: Tracks the number of current reconnection attempts.
--   `maxRetryAttempts: Int`: Maximum number of times to attempt reconnection.
--   `baseRetryDelay: TimeInterval`: The base delay (in seconds) for exponential backoff during reconnection.
--   `lastEventID: String?`: The ID of the last successfully processed event, used for reconnection.
--   `customRetryDelay: TimeInterval?`: A server-suggested retry delay (from an SSE `retry` field).
-
-### Initialization
-```swift
-public init(serverURL: URL, urlSession: URLSession = .shared, maxRetryAttempts: Int = 5, baseRetryDelay: TimeInterval = 1.0)
-```
--   Initializes the transport with the server URL, an optional URL session, and parameters for reconnection logic.
-
-### Core `MCPTransport` Methods
--   **`connect() async`**
-    -   Initiates the connection to the SSE server.
-    -   Cancels any existing processing task.
-    -   Resets retry attempts and custom delays.
-    -   Yields `.connecting` to `stateStream`.
-    -   Starts a new `sseProcessingTask` to call `establishAndProcessSSEConnection()`.
-
--   **`send(_ data: Data) async throws`**
-    -   Throws `SSETransportError.sendingNotSupported` as SSE is primarily for server-to-client data flow.
-
--   **`disconnect() async`**
-    -   Manually disconnects the SSE stream.
+-   **`disconnect() async`**: 
     -   Sets `currentRetryAttempt` beyond `maxRetryAttempts` to prevent further retries.
     -   Cancels the `sseProcessingTask`.
-    -   Calls `disconnectCleanup()` to finalize disconnection and clean up streams.
+    -   Calls `disconnectCleanup(with: nil)` to yield `.disconnected(error: nil)` and finish the streams if a task was active or streams were open.
 
-### Private Methods
--   **`disconnectCleanup(with error: Error?) async`**
-    -   Centralized cleanup logic.
-    -   Yields `.disconnected(error: error)` to `stateStream`.
-    -   Finishes `incomingMessagesContinuation` and `stateStreamContinuation`.
+## Streams
 
--   **`establishAndProcessSSEConnection() async`**
-    -   The main loop for connecting and processing SSE events.
-    -   Constructs a `URLRequest` with appropriate headers (`Accept: text/event-stream`, `Cache-Control: no-cache`, `Last-Event-ID`).
-    -   Uses `urlSession.bytes(for: request)` to get an `AsyncThrowingStream` of bytes.
-    -   Handles HTTP response codes, expecting 200 OK.
-    -   If successful, yields `.connected` to `stateStream` and resets retry counters.
+-   **`public nonisolated let incomingMessages: AsyncStream<Data>`**: 
+    -   Provides an asynchronous stream of `Data` objects.
+    -   Each `Data` object corresponds to the complete data payload of a received SSE event. Multi-line `data:` fields in an SSE event are concatenated before being yielded.
+
+-   **`public nonisolated let stateStream: AsyncStream<TransportConnectionState>`**: 
+    -   Provides an asynchronous stream of `TransportConnectionState` enum values.
+    -   Allows observers to monitor the connection lifecycle: `.disconnected(error: Error?)`, `.connecting`, `.connected`.
+
+## SSE Specific Behavior
+
+-   **`establishAndProcessSSEConnection()` (Private Method)**:
+    -   Constructs a `URLRequest` with `Accept: text/event-stream` and `Cache-Control: no-cache` headers.
+    -   Includes `Last-Event-ID` header if `lastEventID` is set.
+    -   Uses `urlSession.bytes(for: request)` to get an `AsyncThrowingStream<URLSession.AsyncBytes, Error>`.
+    -   Handles HTTP status codes (expects 200 OK). Non-200 responses result in an error and trigger retry logic.
+    -   Upon successful connection (HTTP 200), updates state to `.connected` and resets retry counters.
     -   Iterates through `asyncByteStream.lines` to parse SSE events:
-        -   Recognizes event fields like `id`, `data`, and `retry`.
-        -   Concatenates multi-line `data` fields.
-        -   When an empty line (event terminator) is encountered, the accumulated `data` is converted to `Data` and yielded to `incomingMessagesContinuation`.
-        -   Updates `lastEventID` and `customRetryDelay` based on received fields.
-    -   Handles errors (including `CancellationError`) by invoking `scheduleReconnection(with: error)`.
+        -   `id:<event_id>`: Updates `lastEventID`.
+        -   `event:<event_name>`: Stores `eventName` (currently logged but not directly used to filter messages for `MCPTransport`).
+        -   `data:<event_data>`: Appends to `currentEventDataLines`. Multiple `data` lines for a single event are concatenated.
+        -   `retry:<milliseconds>`: Parses and sets `customRetryDelay` for subsequent reconnection attempts.
+        -   Empty line: Signals the end of an event. The accumulated `currentEventDataLines` are joined, converted to `Data`, and yielded to `incomingMessagesContinuation`.
+    -   Handles `CancellationError` (e.g., from `disconnect()` or task cancellation) by calling `disconnectCleanup(with: CancellationError())`.
+    -   Other errors trigger retry logic: increments `currentRetryAttempt`, calculates delay (using `customRetryDelay` or exponential backoff), and schedules a new call to `establishAndProcessSSEConnection()` after the delay, unless `maxRetryAttempts` is reached.
+    -   If `maxRetryAttempts` is reached, calls `disconnectCleanup(with: SSETransportError.maxRetriesReached)`.
 
--   **`scheduleReconnection(with error: Error) async`**
-    -   Called when `establishAndProcessSSEConnection` encounters an error or the stream ends.
-    -   Checks if reconnection is permissible (within `maxRetryAttempts` and not a `CancellationError` from an explicit `disconnect`).
-    -   Calculates delay using exponential backoff (`baseRetryDelay * 2^currentRetryAttempt`) or `customRetryDelay`.
-    -   Increments `currentRetryAttempt`.
-    -   Yields `.connecting` to `stateStream`.
-    -   After the delay, recursively calls `establishAndProcessSSEConnection()` to retry.
-    -   If retries are exhausted or not permitted, calls `disconnectCleanup()` with `SSETransportError.maxRetriesReached` or the original error.
+-   **`disconnectCleanup(with error: Error?) async` (Private Method)**:
+    -   Ensures that `stateStreamContinuation` and `incomingMessagesContinuation` are finished exactly once using `hasFinishedStateStream` and `hasFinishedIncomingMessagesStream` flags.
+    -   If `stateStream` is not yet finished, yields `.disconnected(error: error)` and then finishes it.
+    -   If `incomingMessagesStream` is not yet finished, it's finished.
 
-### SSE Parsing Logic
-The `establishAndProcessSSEConnection` method parses lines from the event stream:
--   Lines starting with `:` are comments and ignored.
--   Empty lines signify the end of an event.
--   Recognized fields:
-    -   `id:<event_id>`: Sets `lastEventID`.
-    -   `data:<event_data>`: Appends to `currentEventDataLines`. Multiple `data` lines are concatenated.
-    -   `retry:<milliseconds>`: Sets `customRetryDelay`.
--   Other fields are ignored.
+## Error Handling
+
+`SSETransport` uses the `SSETransportError` enum. Key cases:
+
+-   `.invalidURL`: The provided server URL is malformed.
+-   `.sendingNotSupported`: `send()` method was called.
+-   `.unexpectedHTTPStatus(statusCode: Int, responseBody: String?)`: The server responded with an HTTP status other than 200 OK.
+-   `.sseParsingError(description: String)`: An error occurred while parsing an SSE event field (e.g., non-integer `retry` value).
+-   `.streamEnded`: The SSE stream ended from the server side without a specific error (can be normal).
+-   `.maxRetriesReached`: Automatic reconnection attempts exceeded `maxRetryAttempts`.
+-   `.connectionAttemptFailed(Error)`: Wraps an underlying error that occurred during a connection attempt.
+
+## Example Usage (Conceptual)
+
+```swift
+let sseURL = URL(string: "https://your.server.com/events")!
+let transport = SSETransport(serverURL: sseURL)
+
+// Observe state changes
+Task {
+    for await state in transport.stateStream {
+        print("SSE Transport state: \(state)")
+        if case .disconnected(let error) = state, let error = error {
+            print("Disconnected with error: \(error.localizedDescription)")
+        }
+    }
+    print("SSE state stream finished.")
+}
+
+// Observe incoming messages
+Task {
+    for await data in transport.incomingMessages {
+        if let message = String(data: data, encoding: .utf8) {
+            print("Received SSE message: \(message)")
+            // Process the message (e.g., decode JSON)
+        }
+    }
+    print("SSE incoming messages stream finished.")
+}
+
+// Connect
+print("Attempting to connect SSE...")
+await transport.connect()
+
+// To stop and clean up
+// await transport.disconnect()

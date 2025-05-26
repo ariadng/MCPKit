@@ -40,10 +40,13 @@ public final actor StreamableHTTPTransport: MCPTransport {
     private var currentActorTaskWrapper: ActorTaskWrapper?
 
     public nonisolated let incomingMessages: AsyncStream<Data>
-    private var incomingMessagesContinuation: AsyncStream<Data>.Continuation?
+    private let incomingMessagesContinuation: AsyncStream<Data>.Continuation
 
     public nonisolated let stateStream: AsyncStream<TransportConnectionState>
-    private var stateStreamContinuation: AsyncStream<TransportConnectionState>.Continuation?
+    private let stateStreamContinuation: AsyncStream<TransportConnectionState>.Continuation
+    
+    private var hasFinishedStateStream: Bool = false
+    private var hasFinishedIncomingMessagesStream: Bool = false
 
     public init(serverURL: URL, httpMethod: String = "GET", urlSession: URLSession = .shared) {
         self.serverURL = serverURL
@@ -54,15 +57,15 @@ public final actor StreamableHTTPTransport: MCPTransport {
         self.incomingMessages = AsyncStream<Data> { continuation in
             incomingCont = continuation
         }
-        self.incomingMessagesContinuation = incomingCont
+        self.incomingMessagesContinuation = incomingCont!
 
         var stateCont: AsyncStream<TransportConnectionState>.Continuation!
         self.stateStream = AsyncStream<TransportConnectionState> { continuation in
             stateCont = continuation
         }
-        self.stateStreamContinuation = stateCont
+        self.stateStreamContinuation = stateCont!
         
-        self.stateStreamContinuation?.yield(.disconnected(error: nil))
+        self.stateStreamContinuation.yield(.disconnected(error: nil))
     }
 
     public func connect() async throws {
@@ -72,7 +75,7 @@ public final actor StreamableHTTPTransport: MCPTransport {
             currentActorTaskWrapper = nil
         }
 
-        stateStreamContinuation?.yield(.connecting)
+        stateStreamContinuation.yield(.connecting)
         
         print("StreamableHTTPTransport: Starting new HTTP stream processing task for URL: \(serverURL).")
         
@@ -103,19 +106,19 @@ public final actor StreamableHTTPTransport: MCPTransport {
 
         print("StreamableHTTPTransport: Disconnect called.")
         
-        if wrapperToCancel != nil {
-             stateStreamContinuation?.yield(.disconnected(error: nil)) 
+        if wrapperToCancel != nil { // Indicates a task was active
+             stateStreamContinuation.yield(.disconnected(error: nil)) 
         }
         
-        if incomingMessagesContinuation != nil {
-            incomingMessagesContinuation?.finish()
-            incomingMessagesContinuation = nil
+        if !hasFinishedIncomingMessagesStream {
+            incomingMessagesContinuation.finish()
+            hasFinishedIncomingMessagesStream = true
         }
-        if stateStreamContinuation != nil {
-            stateStreamContinuation?.finish()
-            stateStreamContinuation = nil
+        if !hasFinishedStateStream {
+            stateStreamContinuation.finish()
+            hasFinishedStateStream = true
         }
-        print("StreamableHTTPTransport: Streams finished by disconnect().")
+        print("StreamableHTTPTransport: Streams finished by disconnect().") // This message will also be updated
     }
 
     private func establishAndProcessHTTPStream(taskWrapper: ActorTaskWrapper) async throws {
@@ -159,7 +162,7 @@ public final actor StreamableHTTPTransport: MCPTransport {
                 print("StreamableHTTPTransport: Task \(taskWrapper.id) cancelled before connection fully established.")
                 throw CancellationError()
             }
-            stateStreamContinuation?.yield(.connected)
+            stateStreamContinuation.yield(.connected)
             print("StreamableHTTPTransport: Connected successfully (Task ID: \(taskWrapper.id)).")
             
             for try await line in asyncBytes.lines {
@@ -174,7 +177,7 @@ public final actor StreamableHTTPTransport: MCPTransport {
                 
                 if let jsonData = line.data(using: .utf8) {
                     if !jsonData.isEmpty { 
-                        incomingMessagesContinuation?.yield(jsonData)
+                        incomingMessagesContinuation.yield(jsonData)
                     }
                 } else {
                     print("StreamableHTTPTransport: Warning - failed to convert line to Data. Line: \(line) (Task ID: \(taskWrapper.id))")
@@ -186,7 +189,7 @@ public final actor StreamableHTTPTransport: MCPTransport {
             if currentActorTaskWrapper === taskWrapper {
                 let finalError = error
                 print("StreamableHTTPTransport: Task \(taskWrapper.id) ended with error: \(finalError.localizedDescription)")
-                stateStreamContinuation?.yield(.disconnected(error: finalError))
+                stateStreamContinuation.yield(.disconnected(error: finalError))
                 currentActorTaskWrapper = nil // Clear the task as it has now ended
                 throw finalError // Re-throw to satisfy 'async throws' if necessary, though connect() doesn't catch it.
             } else {

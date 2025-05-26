@@ -1,145 +1,127 @@
 # StdioTransport
 
-## Overview
+`StdioTransport` is a component of `MCPKit` designed to facilitate communication with a local MCP (Model-Context Protocol) server process. It achieves this by managing the server process and utilizing its standard input (stdin), standard output (stdout), and standard error (stderr) pipes for communication. This transport is specifically tailored for macOS environments.
 
-This file defines `StdioTransport`, an actor that implements the `MCPTransport` protocol. It is designed for communication with a local MCP server process by managing its lifecycle and using its standard input (stdin), standard output (stdout), and standard error (stderr) pipes. This transport mechanism is specific to macOS and is conditionally compiled using `#if os(macOS)`.
+## Key Features
 
-## `StdioError` Enum
+-   **Process Management**: Launches and monitors a local server executable.
+-   **Pipe-based Communication**: Uses `stdin` for sending messages to the server and `stdout` for receiving messages. Server errors can be captured from `stderr`.
+-   **Asynchronous Operations**: Leverages Swift's `async/await` for non-blocking operations.
+-   **Message Framing**: Expects newline-delimited JSON messages from the server's stdout and sends messages to stdin followed by a newline character.
+-   **Stream-based Data Handling**:
+    -   `incomingMessages`: An `AsyncStream<Data>` that yields data chunks (typically individual JSON messages) received from the server's stdout.
+    -   `stateStream`: An `AsyncStream<TransportConnectionState>` that provides real-time updates on the connection status (e.g., `.connecting`, `.connected`, `.disconnected`).
+-   **Error Handling**: Defines a `StdioError` enum to represent specific errors that can occur during process management or pipe communication.
+-   **Actor-based Thread Safety**: Implemented as a Swift `actor` to ensure thread-safe access to its internal state.
 
-Defines errors specific to `StdioTransport` operations.
+## Initialization
 
-### Definition
+To use `StdioTransport`, you initialize it with the path to the server executable and optional command-line arguments:
+
 ```swift
-public enum StdioError: Error, LocalizedError {
-    case processLaunchFailed(Error)
-    case pipeError(String)
-    case processTerminatedUnexpectedly(exitCode: Int32, reason: Process.TerminationReason)
-    case stdoutPipeClosed
-    case stdinWriteError(Error)
-    case notConnected
-    case alreadyConnected
-    case unsupportedPlatform
-    // ... (localized descriptions)
-}
+let transport = StdioTransport(
+    commandPath: "/path/to/your/mcp_server_executable",
+    arguments: ["--port", "8080"]
+)
 ```
 
-### Cases
--   `processLaunchFailed(Error)`: Failed to launch the server process, encapsulating the underlying error.
--   `pipeError(String)`: An error occurred with pipe setup or handling.
--   `processTerminatedUnexpectedly(exitCode: Int32, reason: Process.TerminationReason)`: The server process terminated unexpectedly.
--   `stdoutPipeClosed`: The standard output pipe of the server process closed unexpectedly.
--   `stdinWriteError(Error)`: An error occurred while writing to the server's standard input.
--   `notConnected`: Attempted an operation that requires a connection when the transport is not connected.
--   `alreadyConnected`: Attempted to connect when the transport is already connected or in the process of connecting.
--   `unsupportedPlatform`: Indicates an attempt to use `StdioTransport` on a non-macOS platform (though compilation guards should prevent this).
+## Core `MCPTransport` Protocol Implementation
 
-## `StdioTransport` Actor
-
-An actor that manages a local server process and communicates via its standard I/O pipes.
-
-### Definition
-```swift
-public final actor StdioTransport: MCPTransport {
-    // Properties
-    private let serverCommandPath: String
-    private let serverArguments: [String]
-    private var process: Process?
-    private var stdinPipe: Pipe?
-    private var stdoutPipe: Pipe?
-    private var stderrPipe: Pipe?
-
-    private var stdoutReadTask: Task<Void, Never>?
-    private var stderrReadTask: Task<Void, Never>?
-
-    private let incomingMessagesContinuation: AsyncStream<Data>.Continuation
-    public nonisolated let incomingMessages: AsyncStream<Data>
-
-    private let stateStreamContinuation: AsyncStream<TransportConnectionState>.Continuation
-    public nonisolated let stateStream: AsyncStream<TransportConnectionState>
-
-    private var internalState: TransportConnectionState
-    // Initializer, connect, send, disconnect, and private helper methods
-}
-```
-
-### Key Properties
--   `serverCommandPath: String`: The absolute path to the server executable.
--   `serverArguments: [String]`: Arguments to pass to the server executable.
--   `process: Process?`: The `Process` object representing the running server.
--   `stdinPipe: Pipe?`, `stdoutPipe: Pipe?`, `stderrPipe: Pipe?`: Pipes for stdin, stdout, and stderr of the server process.
--   `stdoutReadTask: Task<Void, Never>?`: Task for continuously reading from the server's stdout.
--   `stderrReadTask: Task<Void, Never>?`: Task for continuously reading from the server's stderr (for logging).
--   `incomingMessages: AsyncStream<Data>`: (from `MCPTransport`) Stream for yielding received message data.
--   `stateStream: AsyncStream<TransportConnectionState>`: (from `MCPTransport`) Stream for yielding connection state changes.
--   `internalState: TransportConnectionState`: Tracks the current connection state internally.
-
-### Initialization
-```swift
-public init(commandPath: String, arguments: [String] = [])
-```
--   Initializes the transport with the path to the server command and its arguments.
--   Sets up the `incomingMessages` and `stateStream` along with their continuations.
--   Initial state is set to `.disconnected(error: nil)`.
-
-### Core `MCPTransport` Methods
--   **`connect() async throws`**
+-   **`connect() async throws`**: 
     -   Checks if already connected; throws `StdioError.alreadyConnected` if so.
     -   Updates state to `.connecting`.
     -   Creates `Process`, `stdinPipe`, `stdoutPipe`, and `stderrPipe`.
-    -   Configures the `Process` with the executable URL, arguments, and pipes.
-    -   Sets a `terminationHandler` for the process.
-    -   Attempts to `process.run()`. Throws `StdioError.processLaunchFailed` on failure.
-    -   If successful, starts `stdoutReadTask` and `stderrReadTask`.
-    -   Updates state to `.connected`.
+    -   Sets up the process with the executable path, arguments, and pipes.
+    -   Assigns a `terminationHandler` to the process.
+    -   Attempts to run the process. If launch fails, updates state to `.disconnected(error:)` and throws `StdioError.processLaunchFailed`.
+    -   Starts asynchronous tasks to read from `stdout` and `stderr`.
+    -   Updates state to `.connected` upon successful launch.
 
--   **`send(_ data: Data) async throws`**
-    -   Checks if connected; throws `StdioError.notConnected` if not.
-    -   Writes the provided `data` followed by a newline character (`\n`) to the server's `stdinPipe`. The newline acts as a message frame delimiter.
-    -   Throws `StdioError.stdinWriteError` on failure.
+-   **`send(_ data: Data) async throws`**: 
+    -   Checks if the process is running and connected; throws `StdioError.notConnected` otherwise.
+    -   Writes the provided `Data` to the server process's `stdinPipe`, followed by a newline character (`\n`) for message framing.
+    -   Throws `StdioError.stdinWriteError` if writing fails.
 
--   **`disconnect() async`**
-    -   Updates state to `.disconnected(error: nil)`.
-    -   Calls `cleanupResources()` to terminate the process and release resources.
+-   **`disconnect() async`**: 
+    -   Updates state to `.disconnected(error: nil)` (client-initiated disconnect).
+    -   Calls `cleanupResources()` which:
+        -   Cancels `stdoutReadTask` and `stderrReadTask`.
+        -   Terminates the server `process` if it's running.
+        -   Closes pipe file handles.
+        -   Clears references to `process` and pipes.
+        -   Ensures `incomingMessagesContinuation` and `stateStreamContinuation` are finished if not already done.
 
-### Private Methods
--   **`updateState(_ newState: TransportConnectionState)`**
-    -   Synchronously updates `internalState` and yields `newState` to `stateStreamContinuation`.
+## Streams
 
--   **`handleTermination(of terminatedProcess: Process, error: Error? = nil) async`**
-    -   Called by the `Process.terminationHandler` or when a critical error occurs.
-    -   If the disconnection wasn't client-initiated, updates state to `.disconnected` with an appropriate error.
-    -   Calls `cleanupResources()`.
+-   **`public nonisolated let incomingMessages: AsyncStream<Data>`**: 
+    -   Provides an asynchronous stream of `Data` objects.
+    -   Each `Data` object typically represents a complete JSON message received from the server's standard output, delimited by newlines.
 
--   **`startReadingStdout()`**
-    -   Creates and starts `stdoutReadTask` (a detached task).
-    -   Continuously reads available data from `stdoutPipe`.
-    -   Accumulates data in a buffer. When a newline character is encountered, the data up to and including the newline is considered a complete message.
-    -   This message (without the trailing newline) is then passed to `processStdoutData()`.
-    -   Handles pipe closure by breaking the loop and potentially signaling disconnection.
+-   **`public nonisolated let stateStream: AsyncStream<TransportConnectionState>`**: 
+    -   Provides an asynchronous stream of `TransportConnectionState` enum values.
+    -   Allows observers to monitor the connection lifecycle, including states like `.disconnected(error: Error?)`, `.connecting`, `.connected`.
 
--   **`startReadingStderr()`**
-    -   Creates and starts `stderrReadTask` (a detached task).
-    -   Continuously reads available data from `stderrPipe` and logs it as strings.
+## Error Handling
 
--   **`processStdoutData(_ data: Data)`**
-    -   Called by `startReadingStdout` with a complete message frame.
-    -   Yields the `data` to `incomingMessagesContinuation`.
+The `StdioTransport` uses the `StdioError` enum to report issues. Key error cases include:
 
--   **`cleanupResources() async`**
-    -   Cancels `stdoutReadTask` and `stderrReadTask`.
-    -   Terminates the `process` if it's running.
-    -   Closes file handles associated with pipes.
-    -   Nil-out references to `process`, pipes, and tasks.
-    -   Ensures `incomingMessagesContinuation` and `stateStreamContinuation` are finished if they haven't been already.
+-   `.processLaunchFailed(Error)`: If the server executable cannot be started.
+-   `.pipeError(String)`: For issues related to setting up stdin/stdout/stderr pipes.
+-   `.processTerminatedUnexpectedly(exitCode: Int32, reason: Process.TerminationReason)`: If the server process exits abnormally.
+-   `.stdoutPipeClosed`: If the server's stdout closes unexpectedly.
+-   `.stdinWriteError(Error)`: If writing to the server's stdin fails.
+-   `.notConnected`: If `send()` is called when not connected.
+-   `.alreadyConnected`: If `connect()` is called when already connected or connecting.
 
-### Message Framing
--   **Sending**: Messages sent via `send(_ data: Data)` have a newline character (`\n`) appended to them before being written to the server's stdin.
--   **Receiving**: The `startReadingStdout()` method reads data until a newline character is encountered, treating the segment (excluding the newline) as a complete message.
+## Internal State Management
 
-## `TransportConnectionState` Extension
+-   Uses an `internalState: TransportConnectionState` property, managed by the actor's synchronization.
+-   `updateState(_ newState: TransportConnectionState)` method updates `internalState` and yields the `newState` to `stateStreamContinuation`.
+-   `hasFinishedStateStream` and `hasFinishedIncomingMessagesStream` flags ensure stream continuations are finished exactly once, typically within `cleanupResources()` which is called by `disconnect()` or `handleTermination()`.
 
-The file also includes an extension on `TransportConnectionState` (likely defined in `MCPTransport.swift` or a shared file) to add convenience computed properties:
--   `isDisconnected: Bool`: True if state is `.disconnected`.
--   `isDisconnectedByClient: Bool`: True if state is `.disconnected(error: nil)`, implying a deliberate disconnect.
+## Platform Specificity
 
+`StdioTransport` is conditionally compiled for `os(macOS)` and is not intended for use on other platforms like iOS, watchOS, or tvOS.
+
+## Example Usage (Conceptual)
+
+```swift
+// Initialize
+let transport = StdioTransport(commandPath: "/usr/local/bin/my_mcp_server")
+
+// Observe state changes
+Task {
+    for await state in transport.stateStream {
+        print("Transport state: \(state)")
+    }
+}
+
+// Observe incoming messages
+Task {
+    for await messageData in transport.incomingMessages {
+        // Process messageData (e.g., decode JSON)
+        print("Received message: \(String(data: messageData, encoding: .utf8) ?? "")")
+    }
+}
+
+// Connect
+do {
+    try await transport.connect()
+} catch {
+    print("Failed to connect: \(error)")
+}
+
+// Send a message (assuming connected)
+if let requestData = "{\"jsonrpc\": \"2.0\", \"method\": \"initialize\", \"id\": 1}".data(using: .utf8) {
+    do {
+        try await transport.send(requestData)
+    } catch {
+        print("Failed to send message: \(error)")
+    }
+}
+
+// Disconnect when done
+await transport.disconnect()
 ```
+
+This documentation provides a comprehensive overview of `StdioTransport`, its functionalities, and how to integrate it into an `MCPKit`-based application on macOS.
