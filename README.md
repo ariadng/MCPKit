@@ -31,40 +31,12 @@ Whether you're building on macOS or preparing for iOS/Shortcuts integration, **M
 
 Currently, we are in Phase 1 of the development:
 
-Build a Swift-native MCP server framework with core JSON-RPC message handling, transport support (stdio, streamable HTTP), and a CLI to scaffold, run, and test MCP-compliant servers locally.
+Build a Swift-native MCP client and server framework with core JSON-RPC message handling, transport support (stdio, SSE, streamable HTTP), and a CLI to scaffold, run, and test MCP-compliant servers locally.
 
-## Project Structure
+Here is the project checklist for Phase 1:
 
-```
-MCPKit/
-├── Sources/
-│   ├── Core/
-│   │   ├── MCPMessage.swift
-│   │   ├── MCPError.swift
-│   │   └── MCPContext.swift
-│
-│   ├── Transport/
-│   │   ├── StdioTransport.swift
-│   │   ├── SSETransport.swift
-│   │   └── StreamHTTPTransport.swift
-│
-│   ├── Server/
-│   │   ├── MCPServer.swift      # Entry point, routing, capabilities
-│   │   ├── MCPHandler.swift     # DSL for @tool, @resource, @prompt
-│   │   └── MCPLifecycle.swift   # Lifespan hooks (startup, shutdown)
-|   |   └── MCPSession.swift     # Session + stateless server modes
-│
-│   ├── CLI/
-│   │   ├── main.swift
-│   │   ├── InitCommand.swift
-│   │   └── DevCommand.swift
-│
-│   ├── Utils/
-│   │   ├── Logger.swift
-│   │   └── JSONRPCParser.swift
-│
-├── Tests/
-│   └── ...
-├── Package.swift
-└── README.md
-```
+- Implement official MCP schema into Swift
+- `MCPClient` to create MCP-enabled apps using Swift and SwiftUI
+- `MCPServer` to create MCP servers using Swift
+- CLI tool to scaffold, run, and test MCP servers
+
